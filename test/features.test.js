@@ -225,6 +225,27 @@ test('admin: freezing a shop blocks charges, store-QR payments and payouts, but 
   assert.equal(await bal(u, 'user'), 5000);
 });
 
+test('admin from settings: changing the password and restarting updates the login', async () => {
+  const email = 'settings-admin@tsubupay.example';
+  assert.equal(app.svc.ensureAdmin({ email, password: 'first-password-1' }), 'created');
+  assert.equal(app.svc.ensureAdmin({ email, password: 'first-password-1' }), 'unchanged');
+  const c = new Client();
+  assert.equal((await c.post('/api/admin/login', { email, password: 'first-password-1' })).status, 200);
+  assert.equal(app.svc.ensureAdmin({ email, password: 'second-password-2' }), 'password updated');
+  assert.equal((await c.get('/api/admin/me')).status, 401); // old login ended
+  const d = new Client();
+  assert.equal((await d.post('/api/admin/login', { email, password: 'first-password-1' })).status, 401);
+  assert.equal((await d.post('/api/admin/login', { email: ' Settings-Admin@TsubuPay.example ', password: ' second-password-2\n' })).status, 200);
+});
+
+test('passwords with stray spaces work the same at sign-up and login', async () => {
+  const c = new Client();
+  assert.equal((await c.post('/api/user/register', { phone: '07099990000', name: 'Space', password: '  spaced-pass-1 ', pin: '2580' })).status, 200);
+  const d = new Client();
+  assert.equal((await d.post('/api/user/login', { phone: '07099990000', password: 'spaced-pass-1' })).status, 200);
+  assert.equal((await d.post('/api/user/login', { phone: '07099990000', password: ' spaced-pass-1\n' })).status, 200);
+});
+
 // ===================== receipts =====================
 test('receipts: customer, shop and admin can see it; strangers cannot', async () => {
   const u = await newUser(2000), s = await newShop(), stranger = await newUser(), otherShop = await newShop(), admin = await newAdmin();

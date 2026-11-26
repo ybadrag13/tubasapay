@@ -308,8 +308,8 @@ async function main() {
   // Hosts without a terminal (e.g. Render free): create the admin from settings on start.
   const { TSUBU_ADMIN_EMAIL: adminEmail, TSUBU_ADMIN_PASSWORD: adminPassword } = process.env;
   if (adminEmail && adminPassword) {
-    try { svc.createAdmin({ email: adminEmail, password: adminPassword }); console.log(`Admin account ready: ${adminEmail}`); }
-    catch (e) { if (e.code === 'EMAIL_TAKEN') console.log(`Admin account ready: ${adminEmail}`); else console.error('Admin not created:', e.message); }
+    try { console.log(`Admin account ready (${svc.ensureAdmin({ email: adminEmail, password: adminPassword })}): ${adminEmail.trim().toLowerCase()}`); }
+    catch (e) { console.error('Admin not created:', e.message); }
   }
   // On shutdown (Render sleeps or redeploys), finish sending everything to Turso first.
   const stop = async (sig) => {

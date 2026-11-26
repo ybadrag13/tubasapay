@@ -191,6 +191,21 @@ function createService(db, opts = {}) {
       .run(email, U.hashSecret(password), now()).lastInsertRowid);
   }
 
+  // Used when the admin comes from hosting settings: the settings are the source of truth,
+  // so changing TSUBU_ADMIN_PASSWORD and redeploying always updates the login.
+  function ensureAdmin({ email, password } = {}) {
+    email = str(email, 'Email', { min: 5, max: 120, re: /^[^\s@]+@[^\s@]+\.[^\s@]+$/ }).toLowerCase();
+    password = str(password, 'Password', { min: 12, max: 128 });
+    const row = q('SELECT id, pass_hash FROM admins WHERE email = ?').get(email);
+    if (!row) { createAdmin({ email, password }); return 'created'; }
+    if (U.verifySecret(password, row.pass_hash)) return 'unchanged';
+    tx(db, () => {
+      q('UPDATE admins SET pass_hash = ? WHERE id = ?').run(U.hashSecret(password), row.id);
+      q(`DELETE FROM sessions WHERE kind = 'admin' AND subject_id = ?`).run(row.id); // old logins end
+    });
+    return 'password updated';
+  }
+
   // A fixed dummy hash so a wrong username takes as long as a wrong password.
   const DUMMY = U.hashSecret('dummy-password');
 
@@ -199,7 +214,8 @@ function createService(db, opts = {}) {
     const row = kind === 'user' ? q('SELECT id, pass_hash FROM users WHERE phone = ?').get(id)
       : kind === 'merchant' ? q('SELECT id, pass_hash FROM merchants WHERE email = ?').get(id.toLowerCase())
         : q('SELECT id, pass_hash FROM admins WHERE email = ?').get(id.toLowerCase());
-    const ok = U.verifySecret(String(password ?? ''), row ? row.pass_hash : DUMMY);
+    // Sign-up trims spaces, so login must too (a pasted password often carries a space or newline).
+    const ok = U.verifySecret(String(password ?? '').trim(), row ? row.pass_hash : DUMMY);
     if (!row || !ok) throw err(401, 'LOGIN_FAILED', 'Wrong login details.');
     return createSession(kind, row.id);
   }
@@ -209,7 +225,7 @@ function createService(db, opts = {}) {
     const m = q('SELECT id FROM merchants WHERE store_code = ?').get(String(storeCode ?? '').trim().toUpperCase());
     const s = m ? q('SELECT id, pass_hash, active FROM staff WHERE merchant_id = ? AND username = ?')
       .get(m.id, String(username ?? '').trim().toLowerCase()) : null;
-    const ok = U.verifySecret(String(password ?? ''), s ? s.pass_hash : DUMMY);
+    const ok = U.verifySecret(String(password ?? '').trim(), s ? s.pass_hash : DUMMY);
     if (!s || !ok || !s.active) throw err(401, 'LOGIN_FAILED', 'Wrong login details.');
     return createSession('merchant', m.id, s.id);
   }
@@ -668,7 +684,7 @@ function createService(db, opts = {}) {
 
   return {
     cfg, events,
-    registerUser, registerMerchant, createAdmin, login, staffLogin, session, sessionSubject, logout,
+    registerUser, registerMerchant, createAdmin, ensureAdmin, login, staffLogin, session, sessionSubject, logout,
     userProfile, merchantProfile, adminProfile,
     listStaff, createStaff, setStaffActive, resetStaffPassword,
     issuePayCode, chargeByCode, lookupStore, payStore, lookupRecipient, transfer,
