@@ -1,0 +1,10 @@
+{
+  "name": "TsubuPay",
+  "short_name": "TsubuPay",
+  "start_url": "/user/",
+  "scope": "/user/",
+  "display": "standalone",
+  "background_color": "#f4f7f5",
+  "theme_color": "#0f8a6c",
+  "icons": [{ "src": "/lib/icon.svg", "sizes": "any", "type": "image/svg+xml" }]
+}
