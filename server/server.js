@@ -27,7 +27,9 @@ const SECURITY_HEADERS = {
 };
 
 function createApp(options = {}) {
-  const db = open(options.dbPath || process.env.TSUBU_DB || path.resolve(__dirname, '..', 'data', 'tsubupay.db'));
+  const db = options.db || open(options.dbPath || process.env.TSUBU_DB || path.resolve(__dirname, '..', 'data', 'tsubupay.db'));
+  const replicator = options.replicator || null; // set when Turso keeps the data permanently
+  const storage = () => (replicator ? replicator.status() : { mode: 'local', synced: true });
   const svc = createService(db, options.service || {});
   const limiter = new RateLimiter();
   const limits = { login: 10, register: 10, chargeFail: 30, lookup: 20, adminLogin: 10, ...(options.limits || {}) };
@@ -128,7 +130,7 @@ function createApp(options = {}) {
 
   // ---------- routes ----------
   const routes = {
-    'GET /api/health': () => ({ ok: true, name: 'TsubuPay' }),
+    'GET /api/health': () => ({ ok: true, name: 'TsubuPay', storage: storage() }),
 
     // customer
     'POST /api/user/register': async (req, res, body) => {
@@ -219,7 +221,7 @@ function createApp(options = {}) {
     },
     'POST /api/admin/logout': (req, res) => logout(req, res, 'admin'),
     'GET /api/admin/me': (req) => svc.adminProfile(auth(req, 'admin')),
-    'GET /api/admin/overview': (req) => { auth(req, 'admin'); return svc.adminOverview(); },
+    'GET /api/admin/overview': (req) => { auth(req, 'admin'); return { ...svc.adminOverview(), storage: storage() }; },
     'GET /api/admin/users': (req, res, body, url) => { auth(req, 'admin'); return { items: svc.adminUsers(url.searchParams.get('q'), url.searchParams.get('limit')) }; },
     'GET /api/admin/merchants': (req, res, body, url) => { auth(req, 'admin'); return { items: svc.adminMerchants(url.searchParams.get('q'), url.searchParams.get('limit')) }; },
     'GET /api/admin/transactions': (req, res, body, url) => {
@@ -277,6 +279,9 @@ function createApp(options = {}) {
       let body = {};
       if (req.method === 'POST') { checkWrite(req); body = await readJson(req); }
       const out = await handler(req, res, body, url);
+      // With Turso, a write is only confirmed once it is stored permanently.
+      if (replicator && req.method === 'POST' && !(await replicator.settle(10000)))
+        console.error('[tsubupay] Turso is slow: reply sent before sync finished (it keeps retrying).');
       if (out !== undefined) send(res, 200, out);
     } catch (e) {
       if (e instanceof ApiError) return send(res, e.status, { error: { code: e.code, message: e.message } });
@@ -289,26 +294,42 @@ function createApp(options = {}) {
 
   // HTTPS when a certificate is given (phone cameras only work on https or localhost).
   const server = options.tls ? require('node:https').createServer(options.tls, handle) : http.createServer(handle);
-  return { server, svc, db };
+  return { server, svc, db, replicator };
 }
 
-if (require.main === module) {
+async function main() {
+  const { openStore } = require('./store');
   const port = Number(process.env.PORT) || 3000;
-  const { TSUBU_TLS_CERT: cert, TSUBU_TLS_KEY: key } = process.env;
+  const { TSUBU_TLS_CERT: cert, TSUBU_TLS_KEY: key, TURSO_DATABASE_URL: tursoUrl, TURSO_AUTH_TOKEN: tursoToken } = process.env;
   const tls = cert && key ? { cert: fs.readFileSync(cert), key: fs.readFileSync(key) } : undefined;
-  const { server, svc } = createApp({ tls, secureCookies: !!tls || undefined, trustProxy: process.env.TSUBU_TRUST_PROXY === '1' });
+  const store = await openStore({ dbPath: process.env.TSUBU_DB || path.resolve(__dirname, '..', 'data', 'tsubupay.db'), tursoUrl, tursoToken });
+  console.log(tursoUrl ? 'Storage: Turso (permanent) + local working copy' : 'Storage: local SQLite file');
+  const { server, svc } = createApp({ db: store.db, replicator: store.replicator, tls, secureCookies: !!tls || undefined, trustProxy: process.env.TSUBU_TRUST_PROXY === '1' });
   // Hosts without a terminal (e.g. Render free): create the admin from settings on start.
   const { TSUBU_ADMIN_EMAIL: adminEmail, TSUBU_ADMIN_PASSWORD: adminPassword } = process.env;
   if (adminEmail && adminPassword) {
     try { svc.createAdmin({ email: adminEmail, password: adminPassword }); console.log(`Admin account ready: ${adminEmail}`); }
     catch (e) { if (e.code === 'EMAIL_TAKEN') console.log(`Admin account ready: ${adminEmail}`); else console.error('Admin not created:', e.message); }
   }
+  // On shutdown (Render sleeps or redeploys), finish sending everything to Turso first.
+  const stop = async (sig) => {
+    console.log(`${sig}: finishing sync and shutting down…`);
+    server.close();
+    if (store.replicator) console.log((await store.replicator.settle(20000)) ? 'All data saved to Turso.' : 'WARNING: some changes were not saved to Turso.');
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => stop('SIGTERM'));
+  process.on('SIGINT', () => stop('SIGINT'));
   const scheme = tls ? 'https' : 'http';
   server.listen(port, () => {
     console.log(`TsubuPay running on ${scheme}://localhost:${port}`);
     console.log(`  Customer app: ${scheme}://localhost:${port}/user/`);
     console.log(`  Shop app:     ${scheme}://localhost:${port}/shop/`);
   });
+}
+
+if (require.main === module) {
+  main().catch((e) => { console.error('TsubuPay could not start:', e.message); process.exit(1); });
 }
 
 module.exports = { createApp };

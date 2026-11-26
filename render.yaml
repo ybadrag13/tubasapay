@@ -18,3 +18,7 @@ services:
         sync: false                  # you type this in the Render dashboard
       - key: TSUBU_ADMIN_PASSWORD
         sync: false                  # 12+ characters; never commit it
+      - key: TURSO_DATABASE_URL      # keeps data forever (free, no card): libsql://<db>-<you>.turso.io
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false

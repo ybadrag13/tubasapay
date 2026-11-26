@@ -11,7 +11,8 @@ A barcode and QR payment system in the style of PayPay. It has five parts: a **c
 - **Send money to friends** by phone number, with a PIN and an optional message.
 - **Admin dashboard:** customers, shops and transactions, money totals, a live ledger audit, and freezing accounts (with a permanent log of who did it and why).
 - **Receipts** for every payment, refund and transfer, which you can print, email or copy. Only the people involved (and admins) can open them.
-- **49 automated tests**, including race conditions, double-spending, expiry, refunds, roles, freezing, receipts and database upgrades.
+- **Permanent storage with Turso** (free, no card), so data survives restarts on free hosting.
+- **54 automated tests**, including race conditions, double-spending, expiry, refunds, roles, freezing, receipts, database upgrades, and surviving a restart through Turso.
 
 > **Prototype notice.** Top-ups and payouts are *simulated*: no bank is connected. Running real money in Japan requires registration as a 資金移動業者 or 前払式支払手段 issuer under the 資金決済法, along with KYC (identity checks), anti-money-laundering controls and a security audit. See "Going to production" below.
 
@@ -24,7 +25,7 @@ Requires **Node.js 22.5 or newer** (check with `node --version`).
 ```bash
 cd tsubupay
 npm start           # starts on http://localhost:3000
-npm test            # runs the 49 tests
+npm test            # runs the 54 tests
 npm run audit-ledger
 npm run create-admin -- you@example.com "a-long-password"   # make an admin account (12+ character password)
 ```
@@ -79,12 +80,28 @@ Business rules (fee, limits, code lifetime) are in `DEFAULTS` at the top of `ser
 3. When asked, enter `TSUBU_ADMIN_EMAIL` and `TSUBU_ADMIN_PASSWORD` (12+ characters). The admin account is created automatically on every start.
 4. You get a free HTTPS address like `https://tsubupay.onrender.com`. Phone cameras work there too, because it is HTTPS.
 
-**Free-plan limits:** the app sleeps after 15 minutes without visitors and takes up to a minute to wake. **All data resets** whenever it sleeps, restarts or redeploys, because free services have no permanent disk. That's fine for a demo or portfolio; for data that must last, use a paid persistent disk or move the database to a hosted service.
+**Free-plan limits:** the app sleeps after 15 minutes without visitors and takes up to a minute to wake. Free services have no permanent disk, so **use Turso (below) to keep your data**; without it, everything resets whenever the server sleeps or redeploys.
+
+### Keep data forever with Turso (free, no card)
+TsubuPay still works on a fast local SQLite copy, so every money rule stays exactly as tested, and it **copies every committed change to Turso**, in order, inside one remote transaction:
+- **On start**, the server rebuilds its local copy from Turso before serving anyone, including accounts, balances, history, staff, admins and logins.
+- **Every write waits** until Turso confirms before replying, so a sleep or restart loses nothing.
+- **On shutdown** (Render sleeping or redeploying), it finishes sending everything first.
+- **If Turso is briefly down**, the app keeps working and retries in order until it catches up. The admin dashboard shows the sync status.
+
+Setup:
+1. Sign up at turso.tech (GitHub login, no card) and create a database, choosing a Tokyo region if offered.
+2. Copy the **database URL** (`libsql://…turso.io`) and create a **token**.
+3. On Render, under Environment, add `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`, then redeploy.
+4. The first start sets up the tables in Turso automatically (log: `Turso database initialised`). Later starts log `Restored N rows from Turso`.
+
+`npm run audit-ledger` and `npm run create-admin` also work against Turso when those two variables are set.
 
 | Hosting setting | Meaning |
 |---|---|
 | `TSUBU_TRUST_PROXY=1` | Use the visitor's real IP from the host's proxy, so rate limits apply per person |
 | `TSUBU_ADMIN_EMAIL`, `TSUBU_ADMIN_PASSWORD` | Create this admin on start (for hosts without a terminal) |
+| `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN` | Keep all data permanently in Turso |
 
 ---
 
@@ -167,7 +184,8 @@ tsubupay/
 ├── server/
 │   ├── server.js     HTTP server: routes, cookies, CSRF, rate limits, live events, static files
 │   ├── service.js    all money rules (payments, refunds, top-ups, payouts, audit)
-│   ├── db.js         SQLite schema + transaction helper
+│   ├── db.js         SQLite schema, migrations, transaction helper
+│   ├── store.js      Turso sync: restore on start, copy every write, flush on shutdown
 │   └── util.js       hashing, code generation, Luhn, rate limiter
 ├── public/
 │   ├── index.html    landing page
@@ -176,7 +194,7 @@ tsubupay/
 │   ├── admin/        admin dashboard (index.html, admin.js)
 │   ├── receipt/      receipt page (index.html, receipt.js)
 │   └── lib/          codes.js (barcode + QR), common.js (API, UI, scanner), styles.css
-├── test/             api.test.js (27), features.test.js (16), codes.test.js (6)
+├── test/             api (27), features (16), codes (6), turso (5) + fake-turso.js
 └── scripts/          audit.js, create-admin.js, verify_codes.py (optional OpenCV check)
 ```
 

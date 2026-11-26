@@ -57,6 +57,12 @@
           stat('Customer wallets', yen(o.money.customerWallets)), stat('Shop balances', yen(o.money.shopBalances)),
           stat('Fee income', yen(o.money.platformFees)), stat('Total held', yen(o.money.heldTotal))),
           h('p', { class: 'muted' }, 'Total held must equal wallets + shop balances + fees. In production this is matched daily against the bank account.')),
+        h('div', { class: 'card' }, h('h2', {}, 'Storage'),
+          o.storage.mode === 'turso'
+            ? h('div', { class: 'result ' + (o.storage.synced && !o.storage.lastError ? 'ok' : 'err') },
+              o.storage.synced && !o.storage.lastError ? '✓ Saved permanently in Turso. Everything is synced.'
+                : `Syncing to Turso: ${o.storage.pending} change(s) waiting${o.storage.lastError ? ' (' + o.storage.lastError + ')' : ''}. It keeps retrying.`)
+            : h('div', { class: 'result err' }, 'Local storage only. On free hosting, data resets when the server sleeps. Set TURSO_DATABASE_URL to keep it.')),
         h('div', { class: 'card' }, h('h2', {}, 'Ledger audit'),
           o.audit.ok ? h('div', { class: 'result ok' }, '✓ Every transaction balances and all money is accounted for.')
             : h('div', { class: 'result err' }, h('div', {}, '✕ Ledger problems found:'), h('ul', {}, o.audit.problems.map((p) => h('li', {}, p))))));
