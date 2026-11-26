@@ -81,14 +81,15 @@
     });
   }
 
-  function resultScreen({ ok = true, title, amount, lines = [], button = 'Done' }) {
+  function resultScreen({ ok = true, title, amount, lines = [], button = 'Done', receiptId }) {
     return new Promise((resolve) => {
       const s = h('div', { class: 'success-screen' + (ok ? '' : ' fail'), role: 'alertdialog' },
         h('div', { class: 'check' }, ok ? '✓' : '!'),
         h('div', {}, title),
         amount != null ? h('div', { class: 'big' }, yen(amount)) : null,
         lines.map((l) => h('div', { class: 'muted-light' }, l)),
-        h('button', { class: 'btn', onclick: () => { s.remove(); resolve(); } }, button));
+        h('button', { class: 'btn', onclick: () => { s.remove(); resolve(); } }, button),
+        receiptId ? h('a', { class: 'link-light', href: `/receipt/?id=${encodeURIComponent(receiptId)}`, target: '_blank', rel: 'noopener' }, 'View receipt') : null);
       document.body.append(s);
       s.querySelector('button').focus();
     });

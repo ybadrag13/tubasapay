@@ -14,7 +14,7 @@
 
   function show(...nodes) {
     if (scanner) { scanner.stop(); scanner = null; }
-    view.replaceChildren(...nodes);
+    view.replaceChildren(...nodes.filter(Boolean)); // empty slots are skipped, never drawn as text
   }
   const errorLine = () => h('div', { class: 'form-error', role: 'alert' });
   const onAuthError = (ex) => { if (ex.status === 401) { authView(); return true; } return false; };
@@ -23,38 +23,59 @@
   function authView(mode = 'login') {
     nav.hidden = true; logoutBtn.hidden = true; nameEl.textContent = '';
     if (stopEvents) { stopEvents(); stopEvents = null; }
+    document.onkeydown = null;
     const err = errorLine();
     const field = (lab, attrs) => [h('label', { for: attrs.id }, lab), h('input', attrs)];
-    const form = h('form', { novalidate: true },
-      mode === 'signup' ? field('Shop name', { id: 'shopName', maxlength: 60 }) : null,
-      field('Email', { id: 'email', type: 'email', autocomplete: 'email' }),
-      field('Password', { id: 'password', type: 'password', autocomplete: mode === 'signup' ? 'new-password' : 'current-password' }),
-      mode === 'signup' ? h('p', { class: 'muted' }, 'Password: 8+ characters. Fee: 1.98% per payment, taken automatically.') : null,
-      err, h('button', { class: 'btn', type: 'submit' }, mode === 'signup' ? 'Register shop' : 'Log in'));
+    let fields;
+    if (mode === 'staff') {
+      fields = [
+        field('Store code', { id: 'storeCode', autocapitalize: 'characters', maxlength: 8, placeholder: 'e.g. DTGFX7VS', autocomplete: 'off' }),
+        field('Username', { id: 'username', autocapitalize: 'none', autocomplete: 'username', maxlength: 20 }),
+        field('Password', { id: 'password', type: 'password', autocomplete: 'current-password' }),
+        h('p', { class: 'muted' }, 'Cashier accounts are created by the shop owner in the Staff tab.')];
+    } else {
+      fields = [
+        mode === 'signup' ? field('Shop name', { id: 'shopName', maxlength: 60 }) : null,
+        field('Owner email', { id: 'email', type: 'email', autocomplete: 'email' }),
+        field('Password', { id: 'password', type: 'password', autocomplete: mode === 'signup' ? 'new-password' : 'current-password' }),
+        mode === 'signup' ? h('p', { class: 'muted' }, 'Password: 8+ characters. Fee: 1.98% per payment, taken automatically.') : null];
+    }
+    const label = { login: 'Log in as owner', staff: 'Log in as staff', signup: 'Register shop' }[mode];
+    const form = h('form', { novalidate: true }, ...fields, err, h('button', { class: 'btn', type: 'submit' }, label));
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       const btn = form.querySelector('button[type=submit]'); btn.disabled = true; err.textContent = '';
       const v = (id) => form.querySelector('#' + id)?.value ?? '';
       try {
-        shop = mode === 'signup'
-          ? await api('POST', '/api/shop/register', { shopName: v('shopName'), email: v('email'), password: v('password') })
-          : await api('POST', '/api/shop/login', { email: v('email'), password: v('password') });
+        if (mode === 'signup') await api('POST', '/api/shop/register', { shopName: v('shopName'), email: v('email'), password: v('password') });
+        else if (mode === 'staff') await api('POST', '/api/shop/staff-login', { storeCode: v('storeCode').trim().toUpperCase(), username: v('username'), password: v('password') });
+        else await api('POST', '/api/shop/login', { email: v('email'), password: v('password') });
+        shop = await api('GET', '/api/shop/me');
         start();
       } catch (ex) { err.textContent = ex.message; btn.disabled = false; }
     });
+    const tabBtn = (m, text) => h('button', { class: mode === m ? 'active' : '', onclick: () => authView(m) }, text);
     show(h('div', { class: 'card' },
-      h('div', { class: 'tabs' },
-        h('button', { class: mode === 'login' ? 'active' : '', onclick: () => authView('login') }, 'Log in'),
-        h('button', { class: mode === 'signup' ? 'active' : '', onclick: () => authView('signup') }, 'Register a shop')),
+      h('div', { class: 'tabs' }, tabBtn('login', 'Owner'), tabBtn('staff', 'Staff'), tabBtn('signup', 'New shop')),
       form));
   }
 
+  const isOwner = () => shop && shop.role === 'owner';
+  const frozenBanner = () => (shop && shop.frozen ? h('div', { class: 'banner', role: 'alert' },
+    'This shop is frozen by TsubuPay, so it cannot take payments or pay out. Refunds still work. Please contact support.') : null);
+  const receiptLink = (id) => h('a', { href: `/receipt/?id=${encodeURIComponent(id)}`, target: '_blank', rel: 'noopener' }, 'Receipt');
+
   async function reloadShop() {
-    try { shop = await api('GET', '/api/shop/me'); nameEl.textContent = shop.shopName; return shop; }
+    try { shop = await api('GET', '/api/shop/me'); return shop; }
     catch (ex) { onAuthError(ex); return null; }
   }
 
   // ================= navigation =================
+  function buildNav() {
+    const tabs = [['register', 'Register'], ['qr', 'Store QR'], ['sales', 'Sales']];
+    if (isOwner()) tabs.push(['payout', 'Balance'], ['staff', 'Staff']);
+    nav.replaceChildren(...tabs.map(([t, label]) => h('button', { 'data-tab': t }, label)));
+  }
   nav.addEventListener('click', (e) => {
     const b = e.target.closest('button[data-tab]');
     if (b) go(b.dataset.tab);
@@ -62,7 +83,7 @@
   function go(t) {
     tab = t;
     for (const b of nav.querySelectorAll('button')) b.classList.toggle('active', b.dataset.tab === t);
-    ({ register: registerView, qr: qrView, sales: salesView, payout: payoutView })[t]();
+    ({ register: registerView, qr: qrView, sales: salesView, payout: payoutView, staff: staffView })[t]();
   }
 
   // ================= register (CPM: scan the customer's code) =================
@@ -97,8 +118,8 @@
         seenTx.add(tx.id);
         chime(true);
         showResult(true, [h('div', { class: 'big' }, '✓ ' + yen(tx.amount)), h('div', {}, `Paid by ${tx.customerName}`),
-          h('div', { class: 'muted' }, `${when(tx.createdAt)} · ${tx.id} · you receive ${yen(tx.net)}`),
-          h('button', { class: 'btn small', onclick: () => registerView() }, 'Next customer')]);
+          h('div', { class: 'muted' }, `${when(tx.createdAt)} · ${tx.id} · served by ${tx.cashier}`, tx.net != null ? ` · you receive ${yen(tx.net)}` : ''),
+          h('div', { class: 'row', id: 'result-actions' }, h('button', { class: 'btn small', onclick: () => registerView() }, 'Next customer'), receiptLink(tx.id))]);
         codeInput.value = '';
         setAmount('');
       } catch (ex) {
@@ -139,7 +160,7 @@
     };
     document.onkeydown = onKey;
 
-    show(h('div', { class: 'register' },
+    show(frozenBanner(), h('div', { class: 'register' },
       h('div', { class: 'card' },
         h('h2', {}, '1. Amount'), display,
         h('div', { class: 'keypad' }, ['1', '2', '3', '4', '5', '6', '7', '8', '9', '00', '0', '⌫'].map(key)),
@@ -160,7 +181,7 @@
     const list = h('ul', { class: 'list feed', id: 'feed' });
     const paintFeed = () => list.replaceChildren(...(feed.length ? feed.map(feedItem) : [h('li', { class: 'empty' }, 'Waiting for payments… new ones appear here with a chime.')]));
     paintFeed();
-    show(
+    show(frozenBanner(),
       h('div', { class: 'card center printable' },
         h('div', { class: 'logo center' }, 'TsubuPay'),
         h('h2', {}, shop.shopName), qr,
@@ -179,12 +200,13 @@
     document.onkeydown = null;
     const stats = h('div', { class: 'stats' });
     const list = h('ul', { class: 'list' }, h('li', { class: 'empty' }, 'Loading…'));
-    show(h('div', { class: 'card' }, h('h2', {}, 'Today'), stats),
-      h('div', { class: 'card' }, h('h2', {}, 'Transactions'), list));
+    show(frozenBanner(), isOwner() ? h('div', { class: 'card' }, h('h2', {}, 'Today'), stats) : null,
+      h('div', { class: 'card' }, h('h2', {}, 'Transactions'),
+        isOwner() ? null : h('p', { class: 'muted' }, 'Ask the owner to make refunds.'), list));
     const s = await reloadShop();
     if (!s) return;
     const stat = (k, v) => h('div', { class: 'stat' }, h('div', { class: 'k' }, k), h('div', { class: 'v' }, v));
-    stats.replaceChildren(stat('Payments', String(s.today.payments)), stat('Sales', yen(s.today.gross)),
+    if (s.today) stats.replaceChildren(stat('Payments', String(s.today.payments)), stat('Sales', yen(s.today.gross)),
       stat('Refunds', yen(s.today.refunds)), stat('Fees', yen(s.today.fees)), stat('Net', yen(s.today.net)));
     try {
       const { items } = await api('GET', '/api/shop/history?limit=200');
@@ -195,7 +217,8 @@
           title = [t.customerName, h('span', { class: 'tag' }, t.method === 'mpm' ? 'Store QR' : 'Register')];
           if (t.refundedAmount) title.push(h('span', { class: 'tag refund' }, `refunded ${yen(t.refundedAmount)}`));
           amt = '+' + yen(t.amount); cls = 'plus';
-          if (t.refundedAmount < t.amount) extra = h('button', { class: 'btn ghost small', onclick: () => refundFlow(t) }, 'Refund');
+          if (t.cashier) title.push(h('span', { class: 'tag staff' }, t.cashier));
+          if (isOwner() && t.refundedAmount < t.amount) extra = h('button', { class: 'btn ghost small', onclick: () => refundFlow(t) }, 'Refund');
         } else if (t.type === 'refund') {
           title = [`Refund to ${t.customerName}`, h('span', { class: 'tag refund' }, 'REFUND')];
           amt = '−' + yen(t.amount); cls = 'minus';
@@ -204,7 +227,8 @@
         }
         return h('li', {},
           h('div', {}, h('div', { class: 'title' }, ...title),
-            h('div', { class: 'sub' }, `${when(t.createdAt)} · ${t.id}${t.type === 'payment' ? ` · fee ${yen(t.fee)}` : ''}${t.note ? ' · ' + t.note : ''}`)),
+            h('div', { class: 'sub' }, `${when(t.createdAt)} · ${t.id}${t.type === 'payment' && t.fee != null ? ` · fee ${yen(t.fee)}` : ''}${t.note ? ' · ' + t.note : ''} · `,
+              t.type === 'payout' ? null : receiptLink(t.id))),
           h('div', { class: 'row' }, extra, h('div', { class: 'amt ' + cls }, amt)));
       }));
     } catch (ex) { if (!onAuthError(ex)) list.replaceChildren(h('li', { class: 'empty' }, ex.message)); }
@@ -250,7 +274,7 @@
         payoutView();
       } catch (ex) { if (!onAuthError(ex)) { err.textContent = ex.message; btn.disabled = false; } }
     });
-    show(h('div', { class: 'card' },
+    show(frozenBanner(), h('div', { class: 'card' },
       h('div', { class: 'balance-label' }, 'Available balance'), h('div', { class: 'balance' }, yen(s.balance)),
       h('p', { class: 'muted' }, `Fee ${(s.feeBps / 100).toFixed(2)}% per payment, already deducted. Refunds return the fee in proportion.`),
       h('label', { for: 'payout-amount' }, 'Amount (leave empty for all)'), amt, err, btn),
@@ -261,9 +285,61 @@
           h('li', {}, h('span', { class: 'muted' }, 'Store code'), h('span', { class: 'store-code' }, s.storeCode)))));
   }
 
+  // ================= staff management (owner) =================
+  async function staffView() {
+    document.onkeydown = null;
+    const list = h('ul', { class: 'list' }, h('li', { class: 'empty' }, 'Loading…'));
+    const err = errorLine();
+    const name = h('input', { id: 'staff-name', maxlength: 40, placeholder: 'e.g. Aki Tanaka' });
+    const user = h('input', { id: 'staff-user', maxlength: 20, autocapitalize: 'none', placeholder: 'e.g. aki (letters, numbers, _)' });
+    const pass = h('input', { id: 'staff-pass', type: 'password', autocomplete: 'new-password', placeholder: '8+ characters' });
+    const add = h('button', { class: 'btn' }, 'Add cashier');
+    add.addEventListener('click', async () => {
+      err.textContent = ''; add.disabled = true;
+      try {
+        const s = await api('POST', '/api/shop/staff', { name: name.value, username: user.value, password: pass.value });
+        toast(`${s.name} can now log in with store code ${shop.storeCode} and username “${s.username}”.`, 6000);
+        staffView();
+      } catch (ex) { if (!onAuthError(ex)) { err.textContent = ex.message; add.disabled = false; } }
+    });
+
+    async function setActive(s, active) {
+      if (!active && !(await confirmBox({ title: `Deactivate ${s.name}?`, body: 'They are logged out right away and can no longer take payments.', ok: 'Deactivate', danger: true }))) return;
+      try { await api('POST', '/api/shop/staff/active', { staffId: s.id, active }); staffView(); }
+      catch (ex) { if (!onAuthError(ex)) toast(ex.message); }
+    }
+    async function resetPw(s) {
+      const pw = h('input', { id: 'new-pw', type: 'password', autocomplete: 'new-password', placeholder: '8+ characters' });
+      if (!(await confirmBox({ title: `New password for ${s.name}`, body: h('div', {}, h('label', { for: 'new-pw' }, 'New password'), pw, h('p', { class: 'muted' }, 'They will be logged out and must use the new password.')), ok: 'Save' }))) return;
+      try { await api('POST', '/api/shop/staff/password', { staffId: s.id, password: pw.value }); toast('Password changed.'); }
+      catch (ex) { if (!onAuthError(ex)) toast(ex.message, 4000); }
+    }
+
+    show(h('div', { class: 'register' },
+      h('div', { class: 'card' }, h('h2', {}, 'Your staff'),
+        h('p', { class: 'muted' }, `Cashiers log in on the Staff tab with store code `, h('b', {}, shop.storeCode),
+          '. They can take payments but cannot refund, pay out, or see the balance.'), list),
+      h('div', { class: 'card' }, h('h2', {}, 'Add a cashier'),
+        h('label', { for: 'staff-name' }, 'Name'), name,
+        h('label', { for: 'staff-user' }, 'Username'), user,
+        h('label', { for: 'staff-pass' }, 'Password'), pass, err, h('p'), add)));
+    try {
+      const { items } = await api('GET', '/api/shop/staff');
+      if (!items.length) return list.replaceChildren(h('li', { class: 'empty' }, 'No staff yet. Add your first cashier.'));
+      list.replaceChildren(...items.map((s) => h('li', {},
+        h('div', {}, h('div', { class: 'title' }, s.name, h('span', { class: 'status ' + (s.active ? 'ok' : 'bad') }, s.active ? 'Active' : 'Off')),
+          h('div', { class: 'sub' }, `username: ${s.username}`)),
+        h('div', { class: 'row' },
+          h('button', { class: 'btn ghost small', onclick: () => resetPw(s) }, 'Password'),
+          h('button', { class: 'btn ghost small', onclick: () => setActive(s, !s.active) }, s.active ? 'Deactivate' : 'Activate')))));
+    } catch (ex) { if (!onAuthError(ex)) list.replaceChildren(h('li', { class: 'empty' }, ex.message)); }
+  }
+
   // ================= live events =================
   function start() {
-    nav.hidden = false; logoutBtn.hidden = false; nameEl.textContent = shop.shopName;
+    buildNav();
+    nav.hidden = false; logoutBtn.hidden = false;
+    nameEl.textContent = shop.role === 'cashier' ? `${shop.shopName} · ${shop.staffName}` : shop.shopName;
     if (stopEvents) stopEvents();
     stopEvents = listen('/api/shop/events', {
       payment: async ({ tx }) => {

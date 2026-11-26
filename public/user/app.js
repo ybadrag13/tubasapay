@@ -11,7 +11,8 @@
   let inflight = Promise.resolve();
   const track = (p) => { inflight = p.catch(() => {}); return p; };
 
-  function show(...nodes) { stopCode(); view.replaceChildren(...nodes); window.scrollTo(0, 0); }
+  // Empty slots (null/false) are skipped, never drawn as text.
+  function show(...nodes) { stopCode(); view.replaceChildren(...nodes.filter(Boolean)); window.scrollTo(0, 0); }
   const back = (label = '← Back') => h('button', { class: 'btn ghost small', onclick: home }, label);
   const errorLine = () => h('div', { class: 'form-error', role: 'alert' });
 
@@ -59,22 +60,26 @@
     const timerFill = h('div');
     const timerText = h('div', { class: 'muted', id: 'timer-text' }, 'Loading code…');
 
+    const frozen = me.frozen ? h('div', { class: 'banner', role: 'alert' },
+      'Your account is frozen, so payments are paused. Please contact TsubuPay support.') : null;
     show(
+      frozen,
       h('div', { class: 'card' },
         h('div', { class: 'row between' },
           h('div', {}, h('div', { class: 'balance-label' }, 'Balance'), balanceEl),
           h('div', { class: 'muted', 'aria-label': 'Account name' }, me.name))),
-      h('div', { class: 'card paycard' },
+      me.frozen ? null : h('div', { class: 'card paycard' },
         h('div', { class: 'balance-label' }, 'Show this at the register'),
         bar, digits, qr,
         h('div', { class: 'timer' }, timerFill), timerText,
         h('button', { class: 'btn secondary small', onclick: refreshCode }, '↻ New code')),
-      h('div', { class: 'actions' },
-        h('button', { class: 'action', onclick: scanView }, h('span', { class: 'ico' }, '⌗'), 'Scan to pay'),
-        h('button', { class: 'action', onclick: topupView }, h('span', { class: 'ico' }, '+'), 'Top up'),
+      h('div', { class: 'actions four' },
+        h('button', { class: 'action', onclick: scanView, disabled: me.frozen }, h('span', { class: 'ico' }, '⌗'), 'Scan'),
+        h('button', { class: 'action', onclick: sendView, disabled: me.frozen }, h('span', { class: 'ico' }, '↗'), 'Send'),
+        h('button', { class: 'action', onclick: topupView, disabled: me.frozen }, h('span', { class: 'ico' }, '+'), 'Top up'),
         h('button', { class: 'action', onclick: historyView }, h('span', { class: 'ico' }, '≡'), 'History')));
 
-    refreshCode();
+    if (!me.frozen) refreshCode();
   }
 
   async function refreshCode() {
@@ -101,6 +106,7 @@
       codeTimer = setTimeout(refreshCode, REFRESH_MS);
     } catch (ex) {
       if (ex.status === 401) return authView();
+      if (ex.code === 'ACCOUNT_FROZEN') return reloadMe();
       tText.textContent = ex.message + ' Tap "New code" to retry.';
       codeTimer = setTimeout(refreshCode, 10_000);
     }
@@ -116,7 +122,12 @@
   });
 
   async function reloadMe() {
-    try { me = await api('GET', '/api/user/me'); const b = $('#balance'); if (b) b.textContent = yen(me.balance); }
+    try {
+      const wasFrozen = me?.frozen;
+      me = await api('GET', '/api/user/me');
+      const b = $('#balance'); if (b) b.textContent = yen(me.balance);
+      if (b && wasFrozen !== me.frozen) home();
+    }
     catch (ex) { if (ex.status === 401) authView(); }
   }
 
@@ -214,7 +225,7 @@
         shownTx.add(tx.id);
         chime(true);
         await reloadMe();
-        await resultScreen({ title: `Paid to ${tx.shopName}`, amount: tx.amount, lines: [when(tx.createdAt), `Ref ${tx.id}`, 'Show this screen to the shop.'] });
+        await resultScreen({ title: `Paid to ${tx.shopName}`, amount: tx.amount, lines: [when(tx.createdAt), `Ref ${tx.id}`, 'Show this screen to the shop.'], receiptId: tx.id });
         home();
       } catch (ex) { chime(false); err.textContent = ex.message; go.disabled = false; }
     });
@@ -253,6 +264,63 @@
     });
   }
 
+  // ================= send money to a friend =================
+  function sendView() {
+    const err = errorLine();
+    const phone = h('input', { id: 'to-phone', inputmode: 'tel', placeholder: '09012345678', maxlength: 13, autocomplete: 'off' });
+    const next = h('button', { class: 'btn' }, 'Next');
+    const find = async () => {
+      err.textContent = '';
+      const p = phone.value.replace(/\D/g, '');
+      if (!p) { err.textContent = 'Enter your friend\'s phone number.'; return; }
+      next.disabled = true;
+      try { sendAmountView(p, await api('GET', '/api/user/recipient?phone=' + encodeURIComponent(p))); }
+      catch (ex) { if (ex.status === 401) return authView(); err.textContent = ex.message; next.disabled = false; }
+    };
+    next.addEventListener('click', find);
+    phone.addEventListener('keydown', (e) => { if (e.key === 'Enter') find(); });
+    show(back(), h('div', { class: 'card' },
+      h('h2', {}, 'Send money'),
+      h('p', { class: 'muted' }, 'Send to anyone with TsubuPay, free. Up to ¥100,000 each time.'),
+      h('label', { for: 'to-phone' }, 'Their phone number'), phone, err, h('p'), next));
+    phone.focus();
+  }
+
+  function sendAmountView(phone, who) {
+    let amount = '';
+    const display = h('div', { class: 'amount-display' }, '¥0');
+    const msg = h('input', { id: 'send-msg', maxlength: 50, placeholder: 'Message (optional), e.g. Lunch 🍜' });
+    const err = errorLine();
+    const set = (v) => { amount = v.replace(/^0+/, '').slice(0, 6); display.textContent = yen(amount || 0); };
+    const key = (k) => h('button', { type: 'button', class: k.length > 1 ? 'fn' : '', onclick: () => {
+      if (k === 'C') set(''); else if (k === '⌫') set(amount.slice(0, -1)); else set(amount + k);
+    } }, k);
+    const go = h('button', { class: 'btn' }, 'Send');
+    go.addEventListener('click', async () => {
+      err.textContent = '';
+      const n = Number(amount);
+      if (!n) { err.textContent = 'Enter an amount.'; return; }
+      if (n > me.balance) { err.textContent = `Not enough balance (${yen(me.balance)}). Please top up.`; return; }
+      const pin = await pinSheet(`Send ${yen(n)} to ${who.name}`);
+      if (!pin) return;
+      go.disabled = true;
+      try {
+        const tx = await track(api('POST', '/api/user/transfer', { toPhone: phone, amount: n, pin, message: msg.value.trim() }, { idempotencyKey: newKey() }));
+        shownTx.add(tx.id);
+        chime(true);
+        await reloadMe();
+        await resultScreen({ title: `Sent to ${tx.toName}`, amount: tx.amount, lines: [when(tx.createdAt), tx.note ? `“${tx.note}”` : null, `Ref ${tx.id}`].filter(Boolean), receiptId: tx.id });
+        home();
+      } catch (ex) { chime(false); err.textContent = ex.message; go.disabled = false; }
+    });
+    show(back('← Cancel'), h('div', { class: 'card' },
+      h('div', { class: 'muted' }, 'Sending to'),
+      h('h2', {}, who.name), h('div', { class: 'muted' }, `${who.phone} · Balance ${yen(me.balance)}`),
+      display,
+      h('div', { class: 'keypad' }, ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'C', '0', '⌫'].map(key)),
+      h('label', { for: 'send-msg' }, 'Message'), msg, err, h('p'), go));
+  }
+
   // ================= history =================
   async function historyView() {
     const list = h('ul', { class: 'list' }, h('li', { class: 'empty' }, 'Loading…'));
@@ -261,13 +329,18 @@
       const { items } = await api('GET', '/api/user/history?limit=100');
       if (!items.length) return list.replaceChildren(h('li', { class: 'empty' }, 'No transactions yet.'));
       list.replaceChildren(...items.map((t) => {
-        const plus = t.type === 'topup' || t.type === 'refund';
-        const title = t.type === 'topup' ? 'Top up' : t.type === 'refund' ? `Refund from ${t.shopName}` : t.shopName;
+        const plus = t.type === 'topup' || t.type === 'refund' || (t.type === 'transfer' && t.direction === 'in');
+        const title = t.type === 'topup' ? 'Top up'
+          : t.type === 'refund' ? `Refund from ${t.shopName}`
+            : t.type === 'transfer' ? (t.direction === 'in' ? `From ${t.customerName}` : `To ${t.toName}`)
+              : t.shopName;
         return h('li', {},
           h('div', {}, h('div', { class: 'title' }, title,
             t.type === 'refund' ? h('span', { class: 'tag refund' }, 'REFUND') : null,
+            t.type === 'transfer' ? h('span', { class: 'tag' + (t.direction === 'in' ? ' in' : '') }, t.direction === 'in' ? 'RECEIVED' : 'SENT') : null,
             t.type === 'payment' && t.refundedAmount ? h('span', { class: 'tag' }, `refunded ${yen(t.refundedAmount)}`) : null),
-            h('div', { class: 'sub' }, `${when(t.createdAt)} · ${t.id}`)),
+            h('div', { class: 'sub' }, `${when(t.createdAt)}${t.type === 'transfer' && t.note ? ' · “' + t.note + '”' : ''} · `,
+              h('a', { href: `/receipt/?id=${encodeURIComponent(t.id)}`, target: '_blank', rel: 'noopener' }, 'Receipt'))),
           h('div', { class: 'amt ' + (plus ? 'plus' : 'minus') }, (plus ? '+' : '−') + yen(t.amount)));
       }));
     } catch (ex) { if (ex.status === 401) return authView(); list.replaceChildren(h('li', { class: 'empty' }, ex.message)); }
@@ -283,10 +356,18 @@
         if (shownTx.has(tx.id)) return;
         shownTx.add(tx.id);
         chime(true);
-        await resultScreen({ title: `Paid to ${tx.shopName}`, amount: tx.amount, lines: [when(tx.createdAt), `Ref ${tx.id}`] });
+        await resultScreen({ title: `Paid to ${tx.shopName}`, amount: tx.amount, lines: [when(tx.createdAt), `Ref ${tx.id}`], receiptId: tx.id });
         home();
       },
       refund: async ({ tx }) => { await reloadMe(); toast(`Refund ${yen(tx.amount)} from ${tx.shopName}`); },
+      transfer: async ({ tx }) => {
+        await inflight;
+        await reloadMe();
+        if (tx.direction !== 'in' || shownTx.has(tx.id)) return;
+        shownTx.add(tx.id);
+        chime(true);
+        toast(`Received ${yen(tx.amount)} from ${tx.customerName}${tx.note ? ': “' + tx.note + '”' : ''}`, 5000);
+      },
       topup: () => reloadMe(),
     });
     home();

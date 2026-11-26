@@ -1,13 +1,16 @@
 {
   "name": "tsubupay",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "TsubuPay: a QR and barcode payment system with a customer app and a shop app. Zero dependencies.",
   "private": true,
   "license": "MIT",
-  "engines": { "node": ">=22.5" },
+  "engines": {
+    "node": ">=22.5"
+  },
   "scripts": {
     "start": "node --disable-warning=ExperimentalWarning server/server.js",
     "test": "node --disable-warning=ExperimentalWarning --test --test-concurrency=1 test/*.test.js",
-    "audit-ledger": "node --disable-warning=ExperimentalWarning scripts/audit.js"
+    "audit-ledger": "node --disable-warning=ExperimentalWarning scripts/audit.js",
+    "create-admin": "node --disable-warning=ExperimentalWarning scripts/create-admin.js"
   }
 }

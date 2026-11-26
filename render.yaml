@@ -1,0 +1,20 @@
+# Render blueprint: New → Blueprint → pick this repo. Render reads this file.
+services:
+  - type: web
+    name: tsubupay
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: TSUBU_TRUST_PROXY       # Render sits in front of the app; use the real visitor IP
+        value: "1"
+      - key: TSUBU_SECURE_COOKIES
+        value: "1"
+      - key: TSUBU_ADMIN_EMAIL
+        sync: false                  # you type this in the Render dashboard
+      - key: TSUBU_ADMIN_PASSWORD
+        sync: false                  # 12+ characters; never commit it

@@ -14,7 +14,7 @@ const MIME = {
   '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png',
   '.json': 'application/json', '.webmanifest': 'application/manifest+json', '.ico': 'image/x-icon',
 };
-const COOKIE = { user: 'tp_user', merchant: 'tp_shop' };
+const COOKIE = { user: 'tp_user', merchant: 'tp_shop', admin: 'tp_admin' };
 
 const SECURITY_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
@@ -30,7 +30,7 @@ function createApp(options = {}) {
   const db = open(options.dbPath || process.env.TSUBU_DB || path.resolve(__dirname, '..', 'data', 'tsubupay.db'));
   const svc = createService(db, options.service || {});
   const limiter = new RateLimiter();
-  const limits = { login: 10, register: 10, chargeFail: 30, ...(options.limits || {}) };
+  const limits = { login: 10, register: 10, chargeFail: 30, lookup: 20, adminLogin: 10, ...(options.limits || {}) };
   const secureCookies = options.secureCookies ?? process.env.TSUBU_SECURE_COOKIES === '1';
 
   // ---------- small helpers ----------
@@ -108,6 +108,13 @@ function createApp(options = {}) {
     return id;
   }
 
+  // Shop requests act as the owner (staffId null) or as a cashier.
+  function shopActor(req) {
+    const s = svc.session(cookies(req)[COOKIE.merchant], 'merchant');
+    if (!s) throw new ApiError(401, 'UNAUTHENTICATED', 'Please log in.');
+    return { merchantId: s.id, staffId: s.staffId };
+  }
+
   // ---------- live events (Server-Sent Events) ----------
   function sse(req, res, channel) {
     res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store',
@@ -126,12 +133,12 @@ function createApp(options = {}) {
     // customer
     'POST /api/user/register': async (req, res, body) => {
       rate(req, 'register', limits.register);
-      const id = svc.registerUser(body);
-      return login(req, res, 'user', body.phone, body.password, () => svc.userProfile(id));
+      svc.registerUser(body);
+      return login(req, res, 'user', body.phone, body.password, (s) => svc.userProfile(s.id));
     },
     'POST /api/user/login': async (req, res, body) => {
       rate(req, 'login', limits.login);
-      return login(req, res, 'user', body.phone, body.password, (id) => svc.userProfile(id));
+      return login(req, res, 'user', body.phone, body.password, (s) => svc.userProfile(s.id));
     },
     'POST /api/user/logout': (req, res) => logout(req, res, 'user'),
     'GET /api/user/me': (req) => svc.userProfile(auth(req, 'user')),
@@ -139,45 +146,96 @@ function createApp(options = {}) {
     'POST /api/user/topup': (req, res, body) => svc.topup(auth(req, 'user'), body, idem(req)),
     'GET /api/user/store': (req, res, body, url) => { auth(req, 'user'); return svc.lookupStore(url.searchParams.get('code')); },
     'POST /api/user/pay': (req, res, body) => svc.payStore(auth(req, 'user'), body, idem(req)),
+    'GET /api/user/recipient': (req, res, body, url) => {
+      const id = auth(req, 'user');
+      rate(req, `recipient:${id}`, limits.lookup); // stops phone-number fishing
+      return svc.lookupRecipient(id, url.searchParams.get('phone'));
+    },
+    'POST /api/user/transfer': (req, res, body) => svc.transfer(auth(req, 'user'), body, idem(req)),
     'GET /api/user/history': (req, res, body, url) => ({ items: svc.userHistory(auth(req, 'user'), url.searchParams.get('limit')) }),
     'GET /api/user/events': (req, res) => { sse(req, res, `user:${auth(req, 'user')}`); return undefined; },
 
     // shop
     'POST /api/shop/register': async (req, res, body) => {
       rate(req, 'register', limits.register);
-      const id = svc.registerMerchant(body);
-      return login(req, res, 'merchant', body.email, body.password, () => svc.merchantProfile(id));
+      svc.registerMerchant(body);
+      return login(req, res, 'merchant', body.email, body.password, (s) => svc.merchantProfile(s.id));
     },
     'POST /api/shop/login': async (req, res, body) => {
       rate(req, 'login', limits.login);
-      return login(req, res, 'merchant', body.email, body.password, (id) => svc.merchantProfile(id));
+      return login(req, res, 'merchant', body.email, body.password, (s) => svc.merchantProfile(s.id));
+    },
+    'POST /api/shop/staff-login': async (req, res, body) => {
+      rate(req, 'login', limits.login);
+      const { token, maxAgeSec } = svc.staffLogin(body);
+      const s = svc.session(token, 'merchant');
+      res.setHeader('Set-Cookie', setCookie(req, COOKIE.merchant, token, maxAgeSec));
+      return svc.merchantProfile(s.id, s.staffId);
     },
     'POST /api/shop/logout': (req, res) => logout(req, res, 'merchant'),
-    'GET /api/shop/me': (req) => { const id = auth(req, 'merchant'); return { ...svc.merchantProfile(id), today: svc.merchantToday(id) }; },
+    'GET /api/shop/me': (req) => {
+      const a = shopActor(req);
+      const p = svc.merchantProfile(a.merchantId, a.staffId);
+      return a.staffId ? p : { ...p, today: svc.merchantToday(a.merchantId) };
+    },
     'POST /api/shop/charge': (req, res, body) => {
-      const id = auth(req, 'merchant');
-      try { return svc.chargeByCode(id, body, idem(req)); }
+      const a = shopActor(req);
+      try { return svc.chargeByCode(a, body, idem(req)); }
       catch (e) {
         // throttle a shop that keeps sending bad codes (guessing attack)
         if (['CODE_INVALID', 'CODE_NOT_FOUND', 'CODE_EXPIRED', 'CODE_USED'].includes(e.code) &&
-            !limiter.check(`chargefail:${id}`, limits.chargeFail, 60_000))
+            !limiter.check(`chargefail:${a.merchantId}`, limits.chargeFail, 60_000))
           throw new ApiError(429, 'RATE_LIMITED', 'Too many failed scans. Wait a minute.');
         throw e;
       }
     },
-    'POST /api/shop/refund': (req, res, body) => svc.refund(auth(req, 'merchant'), body, idem(req)),
-    'POST /api/shop/payout': (req, res, body) => svc.payout(auth(req, 'merchant'), body, idem(req)),
-    'GET /api/shop/history': (req, res, body, url) => ({ items: svc.merchantHistory(auth(req, 'merchant'), url.searchParams.get('limit')) }),
-    'GET /api/shop/events': (req, res) => { sse(req, res, `merchant:${auth(req, 'merchant')}`); return undefined; },
+    'POST /api/shop/refund': (req, res, body) => svc.refund(shopActor(req), body, idem(req)),
+    'POST /api/shop/payout': (req, res, body) => svc.payout(shopActor(req), body, idem(req)),
+    'GET /api/shop/history': (req, res, body, url) => ({ items: svc.merchantHistory(shopActor(req), url.searchParams.get('limit')) }),
+    'GET /api/shop/events': (req, res) => { sse(req, res, `merchant:${shopActor(req).merchantId}`); return undefined; },
+    'GET /api/shop/staff': (req) => ({ items: svc.listStaff(shopActor(req)) }),
+    'POST /api/shop/staff': (req, res, body) => svc.createStaff(shopActor(req), body),
+    'POST /api/shop/staff/active': (req, res, body) => svc.setStaffActive(shopActor(req), body),
+    'POST /api/shop/staff/password': (req, res, body) => svc.resetStaffPassword(shopActor(req), body),
+
+    // receipts: open to whoever is involved (customer, shop, or admin)
+    'GET /api/receipt': (req, res, body, url) => {
+      const c = cookies(req), id = url.searchParams.get('id');
+      const admin = svc.sessionSubject(c[COOKIE.admin], 'admin');
+      const shop = svc.session(c[COOKIE.merchant], 'merchant');
+      const user = svc.sessionSubject(c[COOKIE.user], 'user');
+      if (!admin && !shop && !user) throw new ApiError(401, 'UNAUTHENTICATED', 'Please log in to see this receipt.');
+      for (const viewer of [admin && { adminId: admin }, shop && { merchantId: shop.id, staffId: shop.staffId }, user && { userId: user }]) {
+        if (!viewer) continue;
+        try { return svc.receipt(id, viewer); } catch (e) { if (e.code !== 'NOT_FOUND') throw e; }
+      }
+      throw new ApiError(404, 'NOT_FOUND', 'Receipt not found.');
+    },
+
+    // admin
+    'POST /api/admin/login': async (req, res, body) => {
+      rate(req, 'adminlogin', limits.adminLogin, 15 * 60_000);
+      return login(req, res, 'admin', body.email, body.password, (s) => svc.adminProfile(s.id));
+    },
+    'POST /api/admin/logout': (req, res) => logout(req, res, 'admin'),
+    'GET /api/admin/me': (req) => svc.adminProfile(auth(req, 'admin')),
+    'GET /api/admin/overview': (req) => { auth(req, 'admin'); return svc.adminOverview(); },
+    'GET /api/admin/users': (req, res, body, url) => { auth(req, 'admin'); return { items: svc.adminUsers(url.searchParams.get('q'), url.searchParams.get('limit')) }; },
+    'GET /api/admin/merchants': (req, res, body, url) => { auth(req, 'admin'); return { items: svc.adminMerchants(url.searchParams.get('q'), url.searchParams.get('limit')) }; },
+    'GET /api/admin/transactions': (req, res, body, url) => {
+      auth(req, 'admin');
+      return { items: svc.adminTransactions({ type: url.searchParams.get('type'), search: url.searchParams.get('q'), limit: url.searchParams.get('limit') }) };
+    },
+    'POST /api/admin/freeze': (req, res, body) => svc.adminSetFrozen(auth(req, 'admin'), body),
+    'GET /api/admin/log': (req, res, body, url) => { auth(req, 'admin'); return { items: svc.adminLogList(url.searchParams.get('limit')) }; },
   };
 
   const idem = (req) => req.headers['idempotency-key'] || undefined;
 
   function login(req, res, kind, idField, password, profile) {
     const { token, maxAgeSec } = svc.login(kind, idField, password);
-    const id = svc.sessionSubject(token, kind);
     res.setHeader('Set-Cookie', setCookie(req, COOKIE[kind], token, maxAgeSec));
-    return profile(id);
+    return profile(svc.session(token, kind));
   }
 
   function logout(req, res, kind) {
@@ -190,7 +248,7 @@ function createApp(options = {}) {
   function serveStatic(req, res, pathname) {
     let rel = decodeURIComponent(pathname);
     if (rel === '/') rel = '/index.html';
-    else if (rel === '/user' || rel === '/shop') { res.writeHead(301, { Location: rel + '/' }); return res.end(); }
+    else if (['/user', '/shop', '/admin', '/receipt'].includes(rel)) { res.writeHead(301, { Location: rel + '/' }); return res.end(); }
     if (rel.endsWith('/')) rel += 'index.html';
     const file = path.resolve(PUBLIC, '.' + rel);
     if (!file.startsWith(PUBLIC + path.sep)) { res.writeHead(403); return res.end(); }
@@ -238,7 +296,13 @@ if (require.main === module) {
   const port = Number(process.env.PORT) || 3000;
   const { TSUBU_TLS_CERT: cert, TSUBU_TLS_KEY: key } = process.env;
   const tls = cert && key ? { cert: fs.readFileSync(cert), key: fs.readFileSync(key) } : undefined;
-  const { server } = createApp({ tls, secureCookies: !!tls || undefined });
+  const { server, svc } = createApp({ tls, secureCookies: !!tls || undefined, trustProxy: process.env.TSUBU_TRUST_PROXY === '1' });
+  // Hosts without a terminal (e.g. Render free): create the admin from settings on start.
+  const { TSUBU_ADMIN_EMAIL: adminEmail, TSUBU_ADMIN_PASSWORD: adminPassword } = process.env;
+  if (adminEmail && adminPassword) {
+    try { svc.createAdmin({ email: adminEmail, password: adminPassword }); console.log(`Admin account ready: ${adminEmail}`); }
+    catch (e) { if (e.code === 'EMAIL_TAKEN') console.log(`Admin account ready: ${adminEmail}`); else console.error('Admin not created:', e.message); }
+  }
   const scheme = tls ? 'https' : 'http';
   server.listen(port, () => {
     console.log(`TsubuPay running on ${scheme}://localhost:${port}`);

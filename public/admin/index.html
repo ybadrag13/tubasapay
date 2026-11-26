@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#15201c">
+  <meta name="robots" content="noindex">
+  <title>TsubuPay Admin</title>
+  <link rel="stylesheet" href="/lib/styles.css">
+  <link rel="icon" href="/lib/icon.svg">
+</head>
+<body class="admin">
+  <div class="app wide">
+    <header class="topbar">
+      <div class="logo"><span class="logo-dot"></span>TsubuPay <small>Admin</small></div>
+      <div class="row">
+        <span id="admin-email" class="muted-light"></span>
+        <button class="link" id="logout" hidden>Log out</button>
+      </div>
+    </header>
+    <nav class="nav" id="nav" hidden>
+      <button data-tab="overview">Overview</button>
+      <button data-tab="users">Customers</button>
+      <button data-tab="shops">Shops</button>
+      <button data-tab="txs">Transactions</button>
+      <button data-tab="log">Admin log</button>
+    </nav>
+    <main id="view" aria-live="polite"></main>
+  </div>
+  <script src="/lib/common.js"></script>
+  <script src="/admin/admin.js"></script>
+</body>
+</html>
