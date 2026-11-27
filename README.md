@@ -13,7 +13,7 @@ A barcode and QR payment system in the style of PayPay. It has five parts: a **c
 - **Receipts** for every payment, refund and transfer, which you can print, email or copy. Only the people involved (and admins) can open them.
 - **Identity verification (eKYC):** SMS code at sign-up (one phone number = one account), ID document photos plus a **live selfie** with a random gesture, **one person = one account** (the same ID can't verify two accounts), and **admin review** before anyone can pay, top up, send money or take payments.
 - **Permanent storage with Turso** (free, no card), so data survives restarts on free hosting.
-- **71 automated tests**, including identity checks, race conditions, double-spending, expiry, refunds, roles, freezing, receipts, database upgrades, and surviving a restart through Turso.
+- **73 automated tests**, including identity checks, race conditions, double-spending, expiry, refunds, roles, freezing, receipts, database upgrades, and surviving a restart through Turso.
 
 > **Prototype notice.** Top-ups and payouts are *simulated*: no bank is connected. Running real money in Japan requires registration as a 資金移動業者 or 前払式支払手段 issuer under the 資金決済法, along with KYC (identity checks), anti-money-laundering controls and a security audit. See "Going to production" below.
 
@@ -26,7 +26,7 @@ Requires **Node.js 22.5 or newer** (check with `node --version`).
 ```bash
 cd tsubupay
 npm start           # starts on http://localhost:3000
-npm test            # runs the 71 tests
+npm test            # runs the 73 tests
 npm run audit-ledger
 npm run create-admin -- you@example.com "a-long-password"   # make an admin account (12+ character password)
 ```
@@ -80,6 +80,10 @@ Business rules (fee, limits, code lifetime) are in `DEFAULTS` at the top of `ser
 2. Sign up at render.com with your GitHub account (no card needed), then choose **New → Blueprint** and pick the repo. Render reads `render.yaml`.
 3. When asked, enter `TSUBU_ADMIN_EMAIL` and `TSUBU_ADMIN_PASSWORD` (12+ characters). The admin account is created automatically on every start.
 4. You get a free HTTPS address like `https://tsubupay.onrender.com`. Phone cameras work there too, because it is HTTPS.
+
+**Keep-awake (included):** `.github/workflows/keepalive.yml` pings `/api/health?deep=1` every 10 minutes from GitHub's free servers. That stops the server sleeping, and it touches Turso so the free database isn't archived after 10 quiet days. One always-on free service uses about 744 of Render's 750 free hours a month. GitHub pauses scheduled workflows after 60 days with no commits; push anything, or click **Enable workflow** under Actions, to resume.
+
+**Backups:** in the admin dashboard, **Overview → Download backup** saves the complete database as one SQLite file. Do it monthly and keep it private, because it contains ID photos and password hashes. Each download is recorded in the admin log.
 
 **Free-plan limits:** the app sleeps after 15 minutes without visitors and takes up to a minute to wake. Free services have no permanent disk, so **use Turso (below) to keep your data**; without it, everything resets whenever the server sleeps or redeploys.
 
@@ -214,7 +218,8 @@ tsubupay/
 │   ├── admin/        admin dashboard (index.html, admin.js)
 │   ├── receipt/      receipt page (index.html, receipt.js)
 │   └── lib/          codes.js (barcode + QR), common.js (API, UI, scanner), styles.css
-├── test/             api (27), features (18), codes (6), turso (7), kyc (13) + fake-turso.js
+├── test/             api (27), features (19), codes (6), turso (8), kyc (13) + fake-turso.js
+├── .github/workflows/keepalive.yml   free keep-awake ping (every 10 minutes)
 └── scripts/          audit.js, create-admin.js, verify_codes.py (optional OpenCV check)
 ```
 
@@ -277,6 +282,7 @@ Every `POST` needs the headers `Content-Type: application/json` and `X-Tsubu-Cli
 | GET | `/api/admin/transactions` | `?type=` and `?q=` (ID) |
 | POST | `/api/admin/freeze` | `kind` (user or merchant), `id, frozen, reason` (reason required to freeze) |
 | GET | `/api/admin/log` | |
+| GET | `/api/admin/backup` | downloads the whole database (SQLite file); max 5 an hour |
 | GET | `/api/admin/kyc` | `?status=pending|approved|rejected` (no images) |
 | GET | `/api/admin/kyc/image` | `?id=&which=front|back|selfie` (admins only, never cached) |
 | POST | `/api/admin/kyc/review` | `id, decision (approve or reject), reason (required to reject)` |

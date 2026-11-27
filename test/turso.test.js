@@ -13,7 +13,7 @@ const LIMITS = { login: 1000, register: 1000, chargeFail: 1000, lookup: 1000, ad
 
 async function boot(fake, token = fake.token) {
   const store = await openStore({ dbPath: ':memory:', tursoUrl: fake.url, tursoToken: token, log: quiet });
-  const app = createApp({ db: store.db, replicator: store.replicator, limits: LIMITS, service: { requireKyc: false, requirePhoneOtp: false } });
+  const app = createApp({ db: store.db, replicator: store.replicator, turso: store.turso, limits: LIMITS, service: { requireKyc: false, requirePhoneOtp: false } });
   await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
   app.base = `http://127.0.0.1:${app.server.address().port}`;
   app.store = store;
@@ -173,5 +173,20 @@ test('an older Turso database (v2) is upgraded to the new version on start, keep
   assert.equal(fake.db.prepare(`SELECT value FROM tsubu_meta`).get().value, '3');
   assert.ok(fake.db.prepare(`SELECT name FROM sqlite_master WHERE name = 'kyc_submissions'`).get());
   assert.equal(store.db.prepare(`SELECT kyc_status FROM users WHERE phone = '09000000009'`).get().kyc_status, 'none');
+  await fake.close();
+});
+
+test('deep health check touches Turso (keeps a free database active) and reports outages', async () => {
+  const fake = await startFakeTurso();
+  const app = await boot(fake);
+  const before = fake.requests;
+  const r = await (await fetch(app.base + '/api/health?deep=1')).json();
+  assert.equal(r.turso.ok, true);
+  assert.ok(fake.requests > before, 'Turso was contacted');
+  const again = fake.requests;
+  await fetch(app.base + '/api/health?deep=1'); // cached for 5 minutes: no extra Turso call
+  assert.equal(fake.requests, again);
+  assert.equal((await (await fetch(app.base + '/api/health')).json()).turso, undefined); // plain health stays local
+  await new Promise((r2) => app.server.close(r2));
   await fake.close();
 });

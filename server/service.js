@@ -857,6 +857,8 @@ function createService(db, opts = {}) {
     });
   }
 
+  const recordAdminAction = (adminId, action) => adminLog(adminId, action, 'system', 0, null);
+
   function adminLogList(limit) {
     return q(`SELECT l.*, a.email FROM admin_log l JOIN admins a ON a.id = l.admin_id ORDER BY l.id DESC LIMIT ?`)
       .all(clampLimit(limit)).map((r) => ({ id: r.id, admin: r.email, action: r.action, targetType: r.target_type,
@@ -891,7 +893,7 @@ function createService(db, opts = {}) {
     issuePayCode, chargeByCode, lookupStore, payStore, lookupRecipient, transfer,
     topup, refund, payout,
     userHistory, merchantHistory, merchantToday, getTx, receipt,
-    adminOverview, adminUsers, adminMerchants, adminTransactions, adminSetFrozen, adminLogList,
+    adminOverview, adminUsers, adminMerchants, adminTransactions, adminSetFrozen, adminLogList, recordAdminAction,
     auditLedger,
   };
 }

@@ -1,0 +1,24 @@
+# Keeps the free TsubuPay server awake and the free Turso database active.
+# Runs on GitHub's free servers every 10 minutes (public repositories: free).
+#  - Render's free server sleeps after 15 quiet minutes; this stops the 1-minute wake-up wait.
+#    One always-on free service uses about 744 of Render's 750 free hours a month.
+#  - Turso archives free databases after 10 days without activity; ?deep=1 touches the database.
+# To use a different address, add a repository variable TSUBU_URL (Settings → Secrets and variables → Actions → Variables).
+# Note: GitHub pauses scheduled workflows after 60 days with no commits. Push anything, or click "Enable workflow", to resume.
+name: Keep TsubuPay awake
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+permissions: {}
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping TsubuPay and its database
+        env:
+          URL: ${{ vars.TSUBU_URL || 'https://tubasapay.onrender.com' }}
+        run: |
+          curl -fsS --max-time 90 --retry 3 --retry-delay 20 "$URL/api/health?deep=1"
+          echo

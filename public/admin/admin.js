@@ -123,6 +123,9 @@
           stat('Customer wallets', yen(o.money.customerWallets)), stat('Shop balances', yen(o.money.shopBalances)),
           stat('Fee income', yen(o.money.platformFees)), stat('Total held', yen(o.money.heldTotal))),
           h('p', { class: 'muted' }, 'Total held must equal wallets + shop balances + fees. In production this is matched daily against the bank account.')),
+        h('div', { class: 'card' }, h('h2', {}, 'Backup'),
+          h('p', { class: 'muted' }, 'Download a complete copy of all TsubuPay data as one SQLite file. Do this monthly and keep it somewhere private: it contains ID photos and password hashes.'),
+          h('a', { class: 'btn secondary', href: '/api/admin/backup', download: '' }, '⬇ Download backup')),
         h('div', { class: 'card' }, h('h2', {}, 'Storage'),
           o.storage.mode === 'turso'
             ? h('div', { class: 'result ' + (o.storage.synced && !o.storage.lastError ? 'ok' : 'err') },
@@ -220,7 +223,7 @@
         h('p', { class: 'muted' }, 'Every freeze, unfreeze and identity decision is recorded here permanently.'),
         table(['Time', 'Admin', 'Action', 'Target', 'Reason'], items.map((l) => h('tr', {},
           h('td', {}, when(l.createdAt)), h('td', {}, l.admin), h('td', {}, l.action),
-          h('td', {}, `${l.targetType === 'user' ? 'Customer' : 'Shop'} #${l.targetId}`), h('td', {}, l.reason || '—'))))));
+          h('td', {}, l.targetType === 'system' ? '—' : `${l.targetType === 'user' ? 'Customer' : 'Shop'} #${l.targetId}`), h('td', {}, l.reason || '—'))))));
     } catch (ex) { if (!onAuthError(ex)) show(h('div', { class: 'card empty' }, ex.message)); }
   }
 

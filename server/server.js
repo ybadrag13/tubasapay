@@ -29,6 +29,9 @@ const SECURITY_HEADERS = {
 function createApp(options = {}) {
   const db = options.db || open(options.dbPath || process.env.TSUBU_DB || path.resolve(__dirname, '..', 'data', 'tsubupay.db'));
   const replicator = options.replicator || null; // set when Turso keeps the data permanently
+  const turso = options.turso || null;
+  const rawDb = db.raw || db; // the plain SQLite handle (for backups)
+  let deepCache = { at: 0, ok: true, error: null };
   const storage = () => (replicator ? replicator.status() : { mode: 'local', synced: true });
   const svc = createService(db, options.service || {});
   const limiter = new RateLimiter();
@@ -132,7 +135,19 @@ function createApp(options = {}) {
 
   // ---------- routes ----------
   const routes = {
-    'GET /api/health': () => ({ ok: true, name: 'TsubuPay', storage: storage() }),
+    // ?deep=1 also touches Turso (at most every 5 minutes), which keeps a free database from being archived.
+    'GET /api/health': async (req, res, body, url) => {
+      const out = { ok: true, name: 'TsubuPay', storage: storage() };
+      if (url.searchParams.get('deep') === '1' && turso) {
+        if (Date.now() - deepCache.at > 5 * 60_000) {
+          try { await turso.query('SELECT 1 AS ok'); deepCache = { at: Date.now(), ok: true, error: null }; }
+          catch (e) { deepCache = { at: Date.now(), ok: false, error: e.message }; }
+        }
+        out.turso = { ok: deepCache.ok, checkedAt: deepCache.at, error: deepCache.error || undefined };
+        if (!deepCache.ok) res.statusCode = 503;
+      }
+      return out;
+    },
 
     // customer
     'POST /api/user/otp': async (req, res, body) => {
@@ -255,6 +270,23 @@ function createApp(options = {}) {
       return undefined;
     },
     'POST /api/admin/kyc/review': (req, res, body) => svc.adminKycReview(auth(req, 'admin'), body),
+    // Full copy of the database as one SQLite file (includes ID photos: keep it private).
+    'GET /api/admin/backup': (req, res) => {
+      const adminId = auth(req, 'admin');
+      rate(req, 'backup', 5, 60 * 60_000);
+      const file = path.join(require('node:os').tmpdir(), `tsubupay-backup-${Date.now()}-${process.pid}.db`);
+      rawDb.exec(`VACUUM INTO '${file.replace(/'/g, "''")}'`);
+      svc.recordAdminAction(adminId, 'backup');
+      const stat = fs.statSync(file);
+      const name = `tsubupay-backup-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.db`;
+      res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'application/vnd.sqlite3', 'Content-Length': stat.size,
+        'Content-Disposition': `attachment; filename="${name}"`, 'Cache-Control': 'no-store, private' });
+      const stream = fs.createReadStream(file);
+      stream.pipe(res);
+      const cleanup = () => fs.rm(file, { force: true }, () => {});
+      stream.on('close', cleanup); res.on('close', cleanup);
+      return undefined;
+    },
   };
 
   const idem = (req) => req.headers['idempotency-key'] || undefined;
@@ -308,7 +340,7 @@ function createApp(options = {}) {
       // With Turso, a write is only confirmed once it is stored permanently.
       if (replicator && req.method === 'POST' && !(await replicator.settle(10000)))
         console.error('[tsubupay] Turso is slow: reply sent before sync finished (it keeps retrying).');
-      if (out !== undefined) send(res, 200, out);
+      if (out !== undefined) send(res, res.statusCode && res.statusCode !== 200 ? res.statusCode : 200, out);
     } catch (e) {
       if (e instanceof ApiError) return send(res, e.status, { error: { code: e.code, message: e.message } });
       if (/CHECK constraint/.test(e?.message)) // safety net fired: refuse, never corrupt
@@ -333,7 +365,7 @@ async function main() {
   const sms = require('./sms').createSms(process.env);
   console.log(sms.mode === 'demo' ? 'SMS: demo mode (codes shown on screen, no real SMS)' : `SMS: ${sms.mode}`);
   if (!process.env.TSUBU_KYC_PEPPER) console.warn('WARNING: TSUBU_KYC_PEPPER is not set; using a built-in default. Set a long random secret in production.');
-  const { server, svc } = createApp({ db: store.db, replicator: store.replicator, sms,
+  const { server, svc } = createApp({ db: store.db, replicator: store.replicator, turso: store.turso, sms,
     service: process.env.TSUBU_KYC_PEPPER ? { kycPepper: process.env.TSUBU_KYC_PEPPER } : {}, tls, secureCookies: !!tls || undefined, trustProxy: process.env.TSUBU_TRUST_PROXY === '1' });
   // Hosts without a terminal (e.g. Render free): create the admin from settings on start.
   const { TSUBU_ADMIN_EMAIL: adminEmail, TSUBU_ADMIN_PASSWORD: adminPassword } = process.env;

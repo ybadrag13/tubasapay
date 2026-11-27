@@ -315,3 +315,25 @@ test('migration: an old (v1) database upgrades with all data and balances kept',
   assert.equal(again.prepare('PRAGMA user_version').get().user_version, 3);
   again.close();
 });
+
+test('backup: admins download a complete, valid database copy; nobody else can', async () => {
+  const u = await newUser(1000);
+  assert.equal((await u.get('/api/admin/backup')).status, 401);
+  const admin = await newAdmin();
+  const cookie = Object.entries(admin.jar).map(([k, v]) => `${k}=${v}`).join('; ');
+  const res = await fetch(base + '/api/admin/backup', { headers: { cookie } });
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-disposition'), /attachment; filename="tsubupay-backup-.*\.db"/);
+  const buf = Buffer.from(await res.arrayBuffer());
+  assert.equal(buf.subarray(0, 15).toString(), 'SQLite format 3');
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'bk-')), 'b.db');
+  fs.writeFileSync(file, buf);
+  const { DatabaseSync } = require('node:sqlite');
+  const copy = new DatabaseSync(file);
+  assert.ok(copy.prepare(`SELECT COUNT(*) n FROM users WHERE phone = ?`).get(u.phone).n === 1);
+  const { createService } = require('../server/service');
+  assert.deepEqual(createService(copy).auditLedger().problems, []);
+  copy.close();
+  const log = (await admin.get('/api/admin/log')).body.items;
+  assert.equal(log[0].action, 'backup');
+});
