@@ -165,5 +165,145 @@
     }
   }
 
-  window.Tsubu = { api, ApiError, newKey, h, $, setSvg, yen, when, toast, confirmBox, resultScreen, chime, listen, Scanner };
+  // ---------- identity verification (KYC) ----------
+  // Shrinks a photo to a sensible size and returns a JPEG data URL.
+  async function toJpeg(source, maxSide = 1280, quality = 0.82) {
+    const bmp = source instanceof HTMLCanvasElement ? source : await createImageBitmap(source);
+    const scale = Math.min(1, maxSide / Math.max(bmp.width, bmp.height));
+    const c = document.createElement('canvas');
+    c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
+    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+    let q = quality, url = c.toDataURL('image/jpeg', q);
+    while (url.length * 0.75 > 1_300_000 && q > 0.4) { q -= 0.1; url = c.toDataURL('image/jpeg', q); }
+    return url;
+  }
+
+  const DOCS = {
+    drivers_license: { label: "Driver's licence (運転免許証)", number: 'Licence number (12 digits)', placeholder: '123456789012', back: true },
+    residence_card: { label: 'Residence card (在留カード)', number: 'Card number (12 characters)', placeholder: 'AB12345678CD', back: true },
+    passport: { label: 'Passport (パスポート)', number: 'Passport number', placeholder: 'TK1234567', back: false },
+  };
+
+  // Full verification screen. base = '/api/user' or '/api/shop'.
+  async function kycScreen(rawView, { base, onBack, who = 'you' }) {
+    // Empty slots (null) are skipped, never drawn as text.
+    const view = { replaceChildren: (...n) => rawView.replaceChildren(...n.filter(Boolean)) };
+    const back = h('button', { class: 'btn ghost small', onclick: onBack }, '← Back');
+    let info;
+    try { info = await api('GET', base + '/kyc'); } catch (e) { view.replaceChildren(back, h('div', { class: 'card' }, e.message)); return; }
+    const card = (...c) => h('div', { class: 'card' }, ...c);
+    if (info.status === 'approved') {
+      view.replaceChildren(back, card(h('div', { class: 'result ok' }, h('div', { class: 'big' }, '✓'), 'Identity verified. All features are unlocked.')));
+      return;
+    }
+    if (info.status === 'pending') {
+      view.replaceChildren(back, card(h('h2', {}, 'Under review'),
+        h('div', { class: 'result ok' }, 'Your ID and selfie were received. TsubuPay staff check them, usually within 1 business day.'),
+        h('p', { class: 'muted' }, 'You will see the result here and in the app as soon as it is decided.')));
+      return;
+    }
+
+    const err = h('div', { class: 'form-error', role: 'alert' });
+    const docType = h('select', { id: 'kyc-doc' }, Object.entries(DOCS).map(([v, d]) => h('option', { value: v }, d.label)));
+    const name = h('input', { id: 'kyc-name', maxlength: 60, placeholder: 'As written on the document', autocomplete: 'name' });
+    const birth = h('input', { id: 'kyc-birth', type: 'date', max: new Date().toISOString().slice(0, 10) });
+    const address = h('input', { id: 'kyc-address', maxlength: 200, placeholder: 'As written on the document', autocomplete: 'street-address' });
+    const number = h('input', { id: 'kyc-number', maxlength: 20, autocomplete: 'off' });
+    const numberLabel = h('label', { for: 'kyc-number' });
+    const photos = { front: null, back: null, selfie: null };
+
+    const photoPicker = (key, title) => {
+      const preview = h('div', { class: 'kyc-preview empty' }, 'No photo yet');
+      const input = h('input', { type: 'file', accept: 'image/*', capture: 'environment', class: 'kyc-file', id: 'kyc-' + key });
+      input.addEventListener('change', async () => {
+        if (!input.files[0]) return;
+        try {
+          photos[key] = await toJpeg(input.files[0]);
+          preview.replaceChildren(h('img', { src: photos[key], alt: title }));
+          preview.classList.remove('empty');
+        } catch { toast('Could not read that photo. Try another.'); }
+      });
+      return h('div', { class: 'kyc-photo', id: 'box-' + key }, h('label', { for: 'kyc-' + key }, title), preview,
+        h('label', { class: 'btn secondary small', for: 'kyc-' + key }, '📷 Take / choose photo'), input);
+    };
+    const frontBox = photoPicker('front', 'Front of the document');
+    const backBox = photoPicker('back', 'Back of the document');
+
+    // Live selfie: camera only (no uploads), with a random gesture from the server.
+    const gestureBox = h('div', { class: 'kyc-gesture', hidden: true });
+    const video = h('video', { class: 'kyc-video', 'aria-label': 'Front camera', playsinline: true });
+    const selfiePreview = h('div', { class: 'kyc-preview empty' }, 'No selfie yet');
+    const camWrap = h('div', { class: 'kyc-cam', hidden: true }, video);
+    let stream = null;
+    const stopCam = () => { if (stream) stream.getTracks().forEach((t) => t.stop()); stream = null; camWrap.hidden = true; };
+    const startBtn = h('button', { class: 'btn secondary small', type: 'button' }, '🤳 Start live selfie');
+    const snapBtn = h('button', { class: 'btn small', type: 'button', hidden: true }, 'Take selfie');
+    startBtn.addEventListener('click', async () => {
+      err.textContent = '';
+      try {
+        const ch = await api('POST', base + '/kyc/challenge');
+        gestureBox.hidden = false;
+        gestureBox.replaceChildren(h('div', { class: 'balance-label' }, 'In your selfie, please:'), h('div', { class: 'kyc-gesture-text' }, ch.gesture));
+        if (!navigator.mediaDevices?.getUserMedia) throw new Error('This browser cannot open the camera. Use Chrome or Safari on your phone.');
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' }, audio: false });
+        video.srcObject = stream; video.muted = true; await video.play();
+        camWrap.hidden = false; snapBtn.hidden = false; startBtn.textContent = '↻ New instruction';
+      } catch (e) { err.textContent = e.message || 'Camera not available. Allow camera access and try again.'; }
+    });
+    snapBtn.addEventListener('click', async () => {
+      if (!video.videoWidth) return;
+      const c = document.createElement('canvas');
+      c.width = video.videoWidth; c.height = video.videoHeight;
+      c.getContext('2d').drawImage(video, 0, 0);
+      photos.selfie = await toJpeg(c, 960);
+      selfiePreview.replaceChildren(h('img', { src: photos.selfie, alt: 'Your selfie' }));
+      selfiePreview.classList.remove('empty');
+      stopCam(); snapBtn.hidden = true; startBtn.textContent = '↻ Retake selfie';
+    });
+
+    const syncDoc = () => {
+      const d = DOCS[docType.value];
+      numberLabel.textContent = d.number; number.placeholder = d.placeholder;
+      backBox.hidden = !d.back;
+    };
+    docType.addEventListener('change', syncDoc); syncDoc();
+
+    const submit = h('button', { class: 'btn' }, 'Submit for review');
+    submit.addEventListener('click', async () => {
+      err.textContent = '';
+      const d = DOCS[docType.value];
+      if (!photos.front || (d.back && !photos.back)) { err.textContent = 'Add photos of the document' + (d.back ? ' (front and back).' : '.'); return; }
+      if (!photos.selfie) { err.textContent = 'Take the live selfie, following the instruction.'; return; }
+      if (!(await confirmBox({ title: 'Submit your identity check?', body: 'Your ID photos and selfie are sent to TsubuPay staff for checking. Only staff can see them.', ok: 'Submit' }))) return;
+      submit.disabled = true; submit.textContent = 'Uploading…';
+      try {
+        await api('POST', base + '/kyc', { docType: docType.value, legalName: name.value, birthDate: birth.value, address: address.value,
+          docNumber: number.value, docFront: photos.front, docBack: d.back ? photos.back : undefined, selfie: photos.selfie });
+        stopCam(); chime(true); toast('Submitted. We will review it soon.');
+        kycScreen(rawView, { base, onBack, who });
+      } catch (e) { err.textContent = e.message; submit.disabled = false; submit.textContent = 'Submit for review'; }
+    });
+
+    const rejected = info.status === 'rejected' && info.lastSubmission
+      ? h('div', { class: 'banner' }, 'Your last check was not approved: ', info.lastSubmission.reason || 'no reason given', '. Please try again.') : null;
+    view.replaceChildren(back, rejected,
+      card(h('h2', {}, 'Verify your identity'),
+        h('p', { class: 'muted' }, `To keep TsubuPay safe, ${who} must prove you are the real owner. One person can have one account. It takes about 3 minutes.`),
+        h('ol', { class: 'kyc-steps' }, h('li', {}, 'Your details, exactly as on your ID'), h('li', {}, 'Photos of your ID'), h('li', {}, 'A live selfie with a simple gesture'))),
+      card(h('h2', {}, '1. Your details'),
+        h('label', { for: 'kyc-doc' }, 'ID document'), docType,
+        h('label', { for: 'kyc-name' }, 'Full legal name'), name,
+        h('label', { for: 'kyc-birth' }, 'Date of birth'), birth,
+        h('label', { for: 'kyc-address' }, 'Address'), address,
+        numberLabel, number,
+        h('p', { class: 'muted' }, 'We never store your document number, only a coded fingerprint that stops it being used for a second account.')),
+      card(h('h2', {}, '2. Photos of your ID'), h('p', { class: 'muted' }, 'Place it on a dark table, all four corners visible, no glare.'),
+        h('div', { class: 'kyc-photos' }, frontBox, backBox)),
+      card(h('h2', {}, '3. Live selfie'), h('p', { class: 'muted' }, 'Taken with your camera now (uploads are not accepted), so we know it is really you.'),
+        gestureBox, camWrap, h('div', { class: 'row' }, startBtn, snapBtn), h('p'), selfiePreview),
+      card(err, submit));
+    window.addEventListener('pagehide', stopCam, { once: true });
+  }
+
+  window.Tsubu = { api, ApiError, newKey, h, $, setSvg, yen, when, toast, confirmBox, resultScreen, chime, listen, Scanner, kycScreen, toJpeg };
 })();

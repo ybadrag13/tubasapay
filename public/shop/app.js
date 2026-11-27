@@ -1,7 +1,7 @@
 // TsubuPay shop (merchant) app
 (function () {
   'use strict';
-  const { api, newKey, h, $, setSvg, yen, when, toast, confirmBox, chime, listen, Scanner } = window.Tsubu;
+  const { api, newKey, h, $, setSvg, yen, when, toast, confirmBox, chime, listen, Scanner, kycScreen } = window.Tsubu;
   const view = $('#view'), nav = $('#nav'), logoutBtn = $('#logout'), nameEl = $('#shop-name');
 
   let shop = null, tab = 'register', stopEvents = null, scanner = null;
@@ -61,8 +61,18 @@
   }
 
   const isOwner = () => shop && shop.role === 'owner';
-  const frozenBanner = () => (shop && shop.frozen ? h('div', { class: 'banner', role: 'alert' },
-    'This shop is frozen by TsubuPay, so it cannot take payments or pay out. Refunds still work. Please contact support.') : null);
+  const frozenBanner = () => {
+    if (shop && shop.frozen) return h('div', { class: 'banner', role: 'alert' },
+      'This shop is frozen by TsubuPay, so it cannot take payments or pay out. Refunds still work. Please contact support.');
+    if (shop && shop.kycStatus && shop.kycStatus !== 'approved') {
+      const msg = { none: 'The owner must verify their identity before this shop can take payments.',
+        pending: 'The owner\'s identity check is under review. Payments unlock once approved.',
+        rejected: 'The owner\'s identity check was not approved. Please submit it again.' }[shop.kycStatus];
+      return h('div', { class: 'card kyc-banner' }, h('div', {}, h('div', { class: 'title' }, '🪪 Shop not verified yet'), h('div', { class: 'muted' }, msg)),
+        isOwner() ? h('button', { class: 'btn small', onclick: () => go('verify') }, shop.kycStatus === 'pending' ? 'View' : 'Verify now') : null);
+    }
+    return null;
+  };
   const receiptLink = (id) => h('a', { href: `/receipt/?id=${encodeURIComponent(id)}`, target: '_blank', rel: 'noopener' }, 'Receipt');
 
   async function reloadShop() {
@@ -74,6 +84,7 @@
   function buildNav() {
     const tabs = [['register', 'Register'], ['qr', 'Store QR'], ['sales', 'Sales']];
     if (isOwner()) tabs.push(['payout', 'Balance'], ['staff', 'Staff']);
+    if (isOwner() && shop.kycStatus !== 'approved') tabs.push(['verify', 'Verify ⚠']);
     nav.replaceChildren(...tabs.map(([t, label]) => h('button', { 'data-tab': t }, label)));
   }
   nav.addEventListener('click', (e) => {
@@ -83,7 +94,7 @@
   function go(t) {
     tab = t;
     for (const b of nav.querySelectorAll('button')) b.classList.toggle('active', b.dataset.tab === t);
-    ({ register: registerView, qr: qrView, sales: salesView, payout: payoutView, staff: staffView })[t]();
+    ({ register: registerView, qr: qrView, sales: salesView, payout: payoutView, staff: staffView, verify: verifyView })[t]();
   }
 
   // ================= register (CPM: scan the customer's code) =================
@@ -285,6 +296,13 @@
           h('li', {}, h('span', { class: 'muted' }, 'Store code'), h('span', { class: 'store-code' }, s.storeCode)))));
   }
 
+  // ================= owner identity verification =================
+  function verifyView() {
+    document.onkeydown = null;
+    if (scanner) { scanner.stop(); scanner = null; }
+    kycScreen(view, { base: '/api/shop', onBack: async () => { await reloadShop(); buildNav(); go('register'); }, who: 'the shop owner' });
+  }
+
   // ================= staff management (owner) =================
   async function staffView() {
     document.onkeydown = null;
@@ -353,6 +371,12 @@
         if (tab === 'sales') salesView();
       },
       refund: () => { if (tab === 'sales') salesView(); },
+      kyc: async ({ status, reason }) => {
+        await reloadShop();
+        chime(status === 'approved');
+        toast(status === 'approved' ? '✓ Shop verified. You can take payments now.' : `Identity check not approved: ${reason || ''}`, 6000);
+        buildNav(); go(status === 'approved' ? 'register' : 'verify');
+      },
     });
     go('register');
   }

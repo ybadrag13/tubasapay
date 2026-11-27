@@ -32,8 +32,10 @@ function createApp(options = {}) {
   const storage = () => (replicator ? replicator.status() : { mode: 'local', synced: true });
   const svc = createService(db, options.service || {});
   const limiter = new RateLimiter();
-  const limits = { login: 10, register: 10, chargeFail: 30, lookup: 20, adminLogin: 10, ...(options.limits || {}) };
+  const limits = { login: 10, register: 10, chargeFail: 30, lookup: 20, adminLogin: 10, otp: 5, ...(options.limits || {}) };
   const secureCookies = options.secureCookies ?? process.env.TSUBU_SECURE_COOKIES === '1';
+  const sms = options.sms || require('./sms').createSms({});
+  const BIG = new Set(['/api/user/kyc', '/api/shop/kyc']); // ID photos + selfie
 
   // ---------- small helpers ----------
   function send(res, status, body, extra = {}) {
@@ -66,12 +68,12 @@ function createApp(options = {}) {
       : req.socket.remoteAddress;
   }
 
-  function readJson(req) {
+  function readJson(req, limit = 16 * 1024) {
     return new Promise((resolve, reject) => {
       let size = 0; const chunks = [];
       req.on('data', (c) => {
         size += c.length;
-        if (size > 16 * 1024) { reject(new ApiError(413, 'TOO_LARGE', 'Request body too large.')); req.destroy(); return; }
+        if (size > limit) { reject(new ApiError(413, 'TOO_LARGE', 'Request body too large.')); req.destroy(); return; }
         chunks.push(c);
       });
       req.on('end', () => {
@@ -133,6 +135,13 @@ function createApp(options = {}) {
     'GET /api/health': () => ({ ok: true, name: 'TsubuPay', storage: storage() }),
 
     // customer
+    'POST /api/user/otp': async (req, res, body) => {
+      rate(req, 'otp', limits.otp, 10 * 60_000);
+      const { phone, code, expiresInSec } = svc.requestPhoneCode(body.phone);
+      try { await sms.send(phone, `TsubuPay sign-up code: ${code} (valid ${Math.round(expiresInSec / 60)} minutes). Never share it.`); }
+      catch (e) { svc.cancelPhoneCode(phone); console.error('[tsubupay] SMS failed:', e.message); throw new ApiError(502, 'SMS_FAILED', 'Could not send the SMS. Please try again.'); }
+      return { sent: true, expiresInSec, demo: sms.mode === 'demo', demoCode: sms.mode === 'demo' ? code : undefined };
+    },
     'POST /api/user/register': async (req, res, body) => {
       rate(req, 'register', limits.register);
       svc.registerUser(body);
@@ -154,6 +163,9 @@ function createApp(options = {}) {
       return svc.lookupRecipient(id, url.searchParams.get('phone'));
     },
     'POST /api/user/transfer': (req, res, body) => svc.transfer(auth(req, 'user'), body, idem(req)),
+    'GET /api/user/kyc': (req) => svc.kycInfo('user', auth(req, 'user')),
+    'POST /api/user/kyc/challenge': (req) => svc.kycChallenge('user', auth(req, 'user')),
+    'POST /api/user/kyc': (req, res, body) => svc.submitKyc('user', auth(req, 'user'), body),
     'GET /api/user/history': (req, res, body, url) => ({ items: svc.userHistory(auth(req, 'user'), url.searchParams.get('limit')) }),
     'GET /api/user/events': (req, res) => { sse(req, res, `user:${auth(req, 'user')}`); return undefined; },
 
@@ -195,6 +207,9 @@ function createApp(options = {}) {
     'POST /api/shop/payout': (req, res, body) => svc.payout(shopActor(req), body, idem(req)),
     'GET /api/shop/history': (req, res, body, url) => ({ items: svc.merchantHistory(shopActor(req), url.searchParams.get('limit')) }),
     'GET /api/shop/events': (req, res) => { sse(req, res, `merchant:${shopActor(req).merchantId}`); return undefined; },
+    'GET /api/shop/kyc': (req) => svc.kycInfo('merchant', shopActor(req).merchantId),
+    'POST /api/shop/kyc/challenge': (req) => { const a = shopActor(req); ownerOnly(a); return svc.kycChallenge('merchant', a.merchantId); },
+    'POST /api/shop/kyc': (req, res, body) => { const a = shopActor(req); ownerOnly(a); return svc.submitKyc('merchant', a.merchantId, body); },
     'GET /api/shop/staff': (req) => ({ items: svc.listStaff(shopActor(req)) }),
     'POST /api/shop/staff': (req, res, body) => svc.createStaff(shopActor(req), body),
     'POST /api/shop/staff/active': (req, res, body) => svc.setStaffActive(shopActor(req), body),
@@ -230,9 +245,20 @@ function createApp(options = {}) {
     },
     'POST /api/admin/freeze': (req, res, body) => svc.adminSetFrozen(auth(req, 'admin'), body),
     'GET /api/admin/log': (req, res, body, url) => { auth(req, 'admin'); return { items: svc.adminLogList(url.searchParams.get('limit')) }; },
+    'GET /api/admin/kyc': (req, res, body, url) => { auth(req, 'admin'); return { items: svc.adminKycList({ status: url.searchParams.get('status'), limit: url.searchParams.get('limit') }) }; },
+    'GET /api/admin/kyc/image': (req, res, body, url) => {
+      auth(req, 'admin');
+      const { buf, type } = svc.adminKycImage(url.searchParams.get('id'), url.searchParams.get('which'));
+      res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': type, 'Content-Length': buf.length,
+        'Cache-Control': 'no-store, private', 'Content-Disposition': 'inline' });
+      res.end(buf);
+      return undefined;
+    },
+    'POST /api/admin/kyc/review': (req, res, body) => svc.adminKycReview(auth(req, 'admin'), body),
   };
 
   const idem = (req) => req.headers['idempotency-key'] || undefined;
+  const ownerOnly = (a) => { if (a.staffId) throw new ApiError(403, 'OWNER_ONLY', 'Only the shop owner can verify the shop.'); };
 
   function login(req, res, kind, idField, password, profile) {
     const { token, maxAgeSec } = svc.login(kind, idField, password);
@@ -277,7 +303,7 @@ function createApp(options = {}) {
     try {
       if (!handler) throw new ApiError(404, 'NOT_FOUND', 'No such endpoint.');
       let body = {};
-      if (req.method === 'POST') { checkWrite(req); body = await readJson(req); }
+      if (req.method === 'POST') { checkWrite(req); body = await readJson(req, BIG.has(url.pathname) ? 6 * 1024 * 1024 : 16 * 1024); }
       const out = await handler(req, res, body, url);
       // With Turso, a write is only confirmed once it is stored permanently.
       if (replicator && req.method === 'POST' && !(await replicator.settle(10000)))
@@ -304,7 +330,11 @@ async function main() {
   const tls = cert && key ? { cert: fs.readFileSync(cert), key: fs.readFileSync(key) } : undefined;
   const store = await openStore({ dbPath: process.env.TSUBU_DB || path.resolve(__dirname, '..', 'data', 'tsubupay.db'), tursoUrl, tursoToken });
   console.log(tursoUrl ? 'Storage: Turso (permanent) + local working copy' : 'Storage: local SQLite file');
-  const { server, svc } = createApp({ db: store.db, replicator: store.replicator, tls, secureCookies: !!tls || undefined, trustProxy: process.env.TSUBU_TRUST_PROXY === '1' });
+  const sms = require('./sms').createSms(process.env);
+  console.log(sms.mode === 'demo' ? 'SMS: demo mode (codes shown on screen, no real SMS)' : `SMS: ${sms.mode}`);
+  if (!process.env.TSUBU_KYC_PEPPER) console.warn('WARNING: TSUBU_KYC_PEPPER is not set; using a built-in default. Set a long random secret in production.');
+  const { server, svc } = createApp({ db: store.db, replicator: store.replicator, sms,
+    service: process.env.TSUBU_KYC_PEPPER ? { kycPepper: process.env.TSUBU_KYC_PEPPER } : {}, tls, secureCookies: !!tls || undefined, trustProxy: process.env.TSUBU_TRUST_PROXY === '1' });
   // Hosts without a terminal (e.g. Render free): create the admin from settings on start.
   const { TSUBU_ADMIN_EMAIL: adminEmail, TSUBU_ADMIN_PASSWORD: adminPassword } = process.env;
   if (adminEmail && adminPassword) {

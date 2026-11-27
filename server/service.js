@@ -20,6 +20,26 @@ const DEFAULTS = {
   userSessionMs: 30 * 24 * 3600 * 1000,
   merchantSessionMs: 7 * 24 * 3600 * 1000,
   adminSessionMs: 8 * 3600 * 1000,
+  requirePhoneOtp: true,            // sign-up needs the 6-digit SMS code
+  requireKyc: true,                 // money actions need an approved identity check
+  otpTtlMs: 5 * 60 * 1000,
+  otpMaxAttempts: 5,
+  otpResendMs: 60 * 1000,
+  kycChallengeMs: 15 * 60 * 1000,
+  kycPepper: 'tsubupay-dev-pepper', // override with TSUBU_KYC_PEPPER in production
+};
+
+// Gestures for the live selfie. The server picks one at random, so an old photo cannot be reused.
+const GESTURES = [
+  'Hold up 2 fingers next to your face', 'Hold up 3 fingers next to your face',
+  'Give a thumbs-up next to your face', 'Touch your left ear with your hand',
+  'Touch your right ear with your hand', 'Make an OK sign next to your face',
+  'Put your open hand flat under your chin', 'Cover one eye with your hand',
+];
+const DOC_RULES = {
+  drivers_license: { re: /^\d{12}$/, label: "driver's licence number (12 digits)", back: true },
+  residence_card: { re: /^[A-Z]{2}\d{8}[A-Z]{2}$/, label: 'residence card number (e.g. AB12345678CD)', back: true },
+  passport: { re: /^[A-Z]{2}\d{7}$/, label: 'passport number (e.g. TK1234567)', back: false },
 };
 
 const err = (status, code, msg) => new U.ApiError(status, code, msg);
@@ -114,6 +134,19 @@ function createService(db, opts = {}) {
     if (!m) throw err(404, 'NOT_FOUND', 'Shop not found.');
     if (m.frozen) throw err(403, 'ACCOUNT_FROZEN', `${who} is frozen. Please contact TsubuPay support.`);
   }
+  // Money actions need an approved identity check (KYC).
+  function kycOk(type, id, code = 'KYC_REQUIRED', msg) {
+    if (!cfg.requireKyc) return;
+    const r = q(`SELECT kyc_status FROM ${type === 'user' ? 'users' : 'merchants'} WHERE id = ?`).get(id);
+    if (!r || r.kyc_status !== 'approved') {
+      const pending = r && r.kyc_status === 'pending';
+      throw err(403, code, msg || (pending ? 'Your identity check is being reviewed. You can pay once it is approved.'
+        : 'Verify your identity first (ID document + selfie) to use payments.'));
+    }
+  }
+  const isVerified = (type, id) => !cfg.requireKyc ||
+    q(`SELECT kyc_status FROM ${type === 'user' ? 'users' : 'merchants'} WHERE id = ?`).get(id)?.kyc_status === 'approved';
+
   function requireOwner(actor) {
     if (actor.staffId) throw err(403, 'OWNER_ONLY', 'Only the shop owner can do this. Ask the owner to log in.');
   }
@@ -149,17 +182,53 @@ function createService(db, opts = {}) {
   }
 
   // ---------- accounts & sessions ----------
-  function registerUser({ phone, name, password, pin } = {}) {
-    phone = str(phone, 'Phone number', { min: 10, max: 11, re: /^0\d{9,10}$/ });
+  // ---------- phone codes (SMS) ----------
+  function requestPhoneCode(phone) {
+    phone = str(String(phone ?? '').replace(/[\s-]/g, ''), 'Phone number', { min: 10, max: 11, re: /^0\d{9,10}$/ });
+    if (q('SELECT 1 FROM users WHERE phone = ?').get(phone)) throw err(409, 'PHONE_TAKEN', 'That phone number already has an account. Please log in.');
+    const old = q('SELECT created_at FROM phone_otps WHERE phone = ?').get(phone);
+    if (old && now() - old.created_at < cfg.otpResendMs) throw err(429, 'OTP_TOO_SOON', 'A code was just sent. Wait a minute before asking again.');
+    let code = '';
+    for (let i = 0; i < 6; i++) code += require('node:crypto').randomInt(10);
+    q(`INSERT INTO phone_otps (phone, code_hash, attempts, expires_at, created_at) VALUES (?, ?, 0, ?, ?)
+       ON CONFLICT(phone) DO UPDATE SET code_hash = excluded.code_hash, attempts = 0, expires_at = excluded.expires_at, created_at = excluded.created_at`)
+      .run(phone, U.sha256(`${phone}:${code}`), now() + cfg.otpTtlMs, now());
+    return { phone, code, expiresInSec: Math.round(cfg.otpTtlMs / 1000) };
+  }
+  const cancelPhoneCode = (phone) => q('DELETE FROM phone_otps WHERE phone = ?').run(phone);
+
+  // Wrong attempts are saved even though sign-up is refused, so the check commits on its own.
+  function usePhoneCode(phone, code) {
+    const r = tx(db, () => {
+      const row = q('SELECT * FROM phone_otps WHERE phone = ?').get(phone);
+      if (!row || row.expires_at <= now()) return 'expired';
+      if (row.attempts >= cfg.otpMaxAttempts) return 'locked';
+      if (typeof code !== 'string' || !/^\d{6}$/.test(code.trim()) || U.sha256(`${phone}:${code.trim()}`) !== row.code_hash) {
+        q('UPDATE phone_otps SET attempts = attempts + 1 WHERE phone = ?').run(phone);
+        return row.attempts + 1 >= cfg.otpMaxAttempts ? 'locked' : 'wrong';
+      }
+      return 'ok';
+    });
+    if (r === 'expired') throw err(400, 'OTP_EXPIRED', 'The SMS code has expired. Ask for a new one.');
+    if (r === 'locked') throw err(429, 'OTP_LOCKED', 'Too many wrong codes. Ask for a new one.');
+    if (r === 'wrong') throw err(400, 'OTP_WRONG', 'Wrong SMS code. Check the message and try again.');
+  }
+
+  function registerUser({ phone, name, password, pin, otp } = {}) {
+    phone = str(String(phone ?? '').replace(/[\s-]/g, ''), 'Phone number', { min: 10, max: 11, re: /^0\d{9,10}$/ });
     name = str(name, 'Name', { max: 40 });
     password = str(password, 'Password', { min: 8, max: 128 });
     if (typeof pin !== 'string' || !/^\d{4}$/.test(pin)) throw err(400, 'FIELD_INVALID', 'PIN must be exactly 4 digits.');
     if (/^(\d)\1{3}$/.test(pin) || pin === '1234') throw err(400, 'PIN_WEAK', 'Choose a less obvious PIN.');
+    if (q('SELECT 1 FROM users WHERE phone = ?').get(phone)) throw err(409, 'PHONE_TAKEN', 'That phone number is already registered.');
+    if (cfg.requirePhoneOtp) usePhoneCode(phone, otp);
     const passHash = U.hashSecret(password), pinHash = U.hashSecret(pin);
     return tx(db, () => {
+      // One phone number, one account (also enforced by the database's UNIQUE rule).
       if (q('SELECT 1 FROM users WHERE phone = ?').get(phone)) throw err(409, 'PHONE_TAKEN', 'That phone number is already registered.');
-      const r = q('INSERT INTO users (phone, name, pass_hash, pin_hash, created_at) VALUES (?, ?, ?, ?, ?)')
-        .run(phone, name, passHash, pinHash, now());
+      const r = q('INSERT INTO users (phone, name, pass_hash, pin_hash, phone_verified, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(phone, name, passHash, pinHash, cfg.requirePhoneOtp ? 1 : 0, now());
+      if (cfg.requirePhoneOtp) q('DELETE FROM phone_otps WHERE phone = ?').run(phone);
       const id = Number(r.lastInsertRowid);
       q(`INSERT INTO accounts (owner_type, owner_id) VALUES ('user', ?)`).run(id);
       return id;
@@ -256,17 +325,19 @@ function createService(db, opts = {}) {
   }
 
   function userProfile(id) {
-    const u = q('SELECT id, phone, name, frozen FROM users WHERE id = ?').get(id);
+    const u = q('SELECT id, phone, name, frozen, kyc_status, phone_verified FROM users WHERE id = ?').get(id);
     if (!u) throw err(404, 'NOT_FOUND', 'User not found.');
-    return { id: u.id, phone: u.phone, name: u.name, frozen: !!u.frozen, balance: account('user', id).balance };
+    return { id: u.id, phone: u.phone, name: u.name, frozen: !!u.frozen, balance: account('user', id).balance,
+      kycStatus: cfg.requireKyc ? u.kyc_status : 'approved', phoneVerified: !!u.phone_verified };
   }
 
   function merchantProfile(id, staffId = null) {
-    const m = q('SELECT id, email, shop_name, store_code, fee_bps, frozen FROM merchants WHERE id = ?').get(id);
+    const m = q('SELECT id, email, shop_name, store_code, fee_bps, frozen, kyc_status FROM merchants WHERE id = ?').get(id);
     if (!m) throw err(404, 'NOT_FOUND', 'Shop not found.');
     const st = staffId ? q('SELECT name, username FROM staff WHERE id = ?').get(staffId) : null;
     const base = {
       id: m.id, shopName: m.shop_name, storeCode: m.store_code, frozen: !!m.frozen,
+      kycStatus: cfg.requireKyc ? m.kyc_status : 'approved',
       storeQr: `TSUBUPAY:STORE:${m.store_code}`,
       role: staffId ? 'cashier' : 'owner', staffName: st?.name ?? null,
     };
@@ -329,6 +400,7 @@ function createService(db, opts = {}) {
   // ---------- customer-presented code (CPM) ----------
   function issuePayCode(userId) {
     userOk(userId);
+    kycOk('user', userId);
     return tx(db, () => {
       const t = now();
       const code = U.newPayCode();
@@ -351,6 +423,7 @@ function createService(db, opts = {}) {
     amount = amountOrThrow(amount, cfg.paymentMax);
     if (!/^88\d{16}$/.test(code) || !U.luhnValid(code)) throw err(400, 'CODE_INVALID', 'That is not a valid TsubuPay code. Scan again.');
     merchantOk(merchantId, 'Your shop');
+    kycOk('merchant', merchantId, 'KYC_REQUIRED', 'The shop owner must verify their identity before taking payments.');
     return run(`charge:${merchantId}`, idemKey, `${code}|${amount}`, () => {
       const t = now();
       const pc = q('SELECT * FROM pay_codes WHERE code_hash = ?').get(U.sha256(code));
@@ -358,6 +431,7 @@ function createService(db, opts = {}) {
       if (pc.used_at) throw err(409, 'CODE_USED', 'This code was already used. Ask the customer to refresh.');
       if (pc.expires_at <= t) throw err(410, 'CODE_EXPIRED', 'This code has expired. Ask the customer to refresh.');
       userOk(pc.user_id, 'The customer\'s account');
+      kycOk('user', pc.user_id, 'KYC_REQUIRED', 'The customer has not finished identity verification.');
       const m = q('SELECT id, fee_bps FROM merchants WHERE id = ?').get(merchantId);
       const ua = account('user', pc.user_id);
       if (ua.balance < amount) throw err(402, 'INSUFFICIENT_FUNDS', 'Customer balance is too low. Ask them to top up.');
@@ -387,6 +461,8 @@ function createService(db, opts = {}) {
     const m = q('SELECT shop_name, store_code, frozen FROM merchants WHERE store_code = ?').get(code);
     if (!m) throw err(404, 'STORE_NOT_FOUND', 'Store not found.');
     if (m.frozen) throw err(403, 'STORE_UNAVAILABLE', 'This shop cannot accept TsubuPay right now.');
+    const mid = q('SELECT id FROM merchants WHERE store_code = ?').get(m.store_code).id;
+    if (!isVerified('merchant', mid)) throw err(403, 'STORE_UNAVAILABLE', 'This shop cannot accept TsubuPay yet (owner not verified).');
     return { shopName: m.shop_name, storeCode: m.store_code };
   }
 
@@ -422,11 +498,12 @@ function createService(db, opts = {}) {
     const code = parseStoreCode(storeCode);
     amount = amountOrThrow(amount, cfg.paymentMax);
     userOk(userId);
+    kycOk('user', userId);
     pinOrThrow(userId, pin);
     return run(`pay:${userId}`, idemKey, `${code}|${amount}`, () => {
       const m = q('SELECT id, fee_bps, frozen FROM merchants WHERE store_code = ?').get(code);
       if (!m) throw err(404, 'STORE_NOT_FOUND', 'Store not found.');
-      if (m.frozen) throw err(403, 'STORE_UNAVAILABLE', 'This shop cannot accept TsubuPay right now.');
+      if (m.frozen || !isVerified('merchant', m.id)) throw err(403, 'STORE_UNAVAILABLE', 'This shop cannot accept TsubuPay right now.');
       const ua = account('user', userId);
       if (ua.balance < amount) throw err(402, 'INSUFFICIENT_FUNDS', 'Your balance is too low. Please top up.');
       const fee = feeFor(amount, m.fee_bps);
@@ -447,7 +524,7 @@ function createService(db, opts = {}) {
     const r = q('SELECT id, name, frozen FROM users WHERE phone = ?').get(phone);
     if (!r) throw err(404, 'RECIPIENT_NOT_FOUND', 'No TsubuPay account uses that number.');
     if (r.id === userId) throw err(400, 'SELF_TRANSFER', 'You cannot send money to yourself.');
-    if (r.frozen) throw err(403, 'RECIPIENT_UNAVAILABLE', 'This person cannot receive money right now.');
+    if (r.frozen || !isVerified('user', r.id)) throw err(403, 'RECIPIENT_UNAVAILABLE', 'This person cannot receive money right now.');
     return { name: r.name, phone: phone.slice(0, 3) + '****' + phone.slice(-4) };
   }
 
@@ -456,11 +533,12 @@ function createService(db, opts = {}) {
     amount = amountOrThrow(amount, cfg.transferMax);
     message = optStr(message, 'Message', 50);
     userOk(userId);
+    kycOk('user', userId);
     lookupRecipient(userId, phone);
     pinOrThrow(userId, pin);
     return run(`transfer:${userId}`, idemKey, `${phone}|${amount}|${message ?? ''}`, () => {
       const to = q('SELECT id, frozen FROM users WHERE phone = ?').get(phone);
-      if (!to || to.frozen) throw err(403, 'RECIPIENT_UNAVAILABLE', 'This person cannot receive money right now.');
+      if (!to || to.frozen || !isVerified('user', to.id)) throw err(403, 'RECIPIENT_UNAVAILABLE', 'This person cannot receive money right now.');
       const from = account('user', userId), dest = account('user', to.id);
       if (from.balance < amount) throw err(402, 'INSUFFICIENT_FUNDS', 'Your balance is too low. Please top up.');
       if (dest.balance + amount > cfg.walletMax) throw err(400, 'RECIPIENT_WALLET_LIMIT', 'The recipient\'s wallet is full. Try a smaller amount.');
@@ -476,6 +554,7 @@ function createService(db, opts = {}) {
   function topup(userId, { amount } = {}, idemKey) {
     amount = amountOrThrow(amount, cfg.topupMax, cfg.topupMin);
     userOk(userId);
+    kycOk('user', userId);
     return run(`topup:${userId}`, idemKey, `${amount}`, () => {
       const ua = account('user', userId);
       if (ua.balance + amount > cfg.walletMax)
@@ -520,6 +599,7 @@ function createService(db, opts = {}) {
     requireOwner(actor);
     const merchantId = actor.merchantId;
     merchantOk(merchantId, 'Your shop');
+    kycOk('merchant', merchantId, 'KYC_REQUIRED', 'Verify your identity before paying out.');
     return run(`payout:${merchantId}`, idemKey, `${amount ?? ''}`, () => {
       const ma = account('merchant', merchantId);
       if (ma.balance <= 0) throw err(400, 'NOTHING_TO_PAY', 'There is no balance to pay out.');
@@ -588,6 +668,124 @@ function createService(db, opts = {}) {
     };
   }
 
+  // ---------- identity verification (KYC) ----------
+  const subjTable = (t) => (t === 'user' ? 'users' : t === 'merchant' ? 'merchants' : null);
+
+  function kycChallenge(type, id) {
+    const current = q('SELECT kyc_status FROM ' + subjTable(type) + ' WHERE id = ?').get(id);
+    if (current.kyc_status === 'approved') throw err(409, 'ALREADY_VERIFIED', 'Your identity is already verified.');
+    const gesture = GESTURES[require('node:crypto').randomInt(GESTURES.length)];
+    q(`INSERT INTO kyc_challenges (subject_type, subject_id, gesture, expires_at) VALUES (?, ?, ?, ?)
+       ON CONFLICT(subject_type, subject_id) DO UPDATE SET gesture = excluded.gesture, expires_at = excluded.expires_at`)
+      .run(type, id, gesture, now() + cfg.kycChallengeMs);
+    return { gesture, expiresInSec: Math.round(cfg.kycChallengeMs / 1000) };
+  }
+
+  function kycInfo(type, id) {
+    const subj = q('SELECT kyc_status FROM ' + subjTable(type) + ' WHERE id = ?').get(id);
+    const last = q(`SELECT doc_type, status, reason, created_at, reviewed_at FROM kyc_submissions
+                    WHERE subject_type = ? AND subject_id = ? ORDER BY id DESC LIMIT 1`).get(type, id);
+    return { status: cfg.requireKyc ? subj.kyc_status : 'approved', required: cfg.requireKyc,
+      lastSubmission: last ? { docType: last.doc_type, status: last.status, reason: last.reason, submittedAt: last.created_at, reviewedAt: last.reviewed_at } : null };
+  }
+
+  // Accepts a data URL or bare base64; checks it really is a JPEG or PNG of a sensible size.
+  function image(v, name) {
+    if (typeof v !== 'string' || !v) throw err(400, 'IMAGE_MISSING', `${name} photo is required.`);
+    const b64 = v.replace(/^data:image\/(jpeg|png);base64,/, '');
+    if (!/^[A-Za-z0-9+/=\s]+$/.test(b64)) throw err(400, 'IMAGE_INVALID', `${name} photo is not a valid image.`);
+    const buf = Buffer.from(b64, 'base64');
+    const jpeg = buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+    const png = buf.slice(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    if (!jpeg && !png) throw err(400, 'IMAGE_INVALID', `${name} photo must be a JPEG or PNG image.`);
+    if (buf.length < 2000) throw err(400, 'IMAGE_INVALID', `${name} photo is too small to read.`);
+    if (buf.length > 1_500_000) throw err(400, 'IMAGE_TOO_LARGE', `${name} photo is too large (max 1.5 MB).`);
+    return buf;
+  }
+
+  function submitKyc(type, id, b = {}) {
+    if (!subjTable(type)) throw err(400, 'FIELD_INVALID', 'Unknown account type.');
+    const rule = DOC_RULES[b.docType];
+    if (!rule) throw err(400, 'FIELD_INVALID', 'Choose a driver\'s licence, residence card or passport.');
+    const legalName = str(b.legalName, 'Full legal name', { min: 2, max: 60 });
+    const birthDate = str(b.birthDate, 'Date of birth', { min: 10, max: 10, re: /^\d{4}-\d{2}-\d{2}$/ });
+    const bd = new Date(birthDate + 'T00:00:00Z');
+    if (Number.isNaN(bd.getTime()) || bd.toISOString().slice(0, 10) !== birthDate || bd.getUTCFullYear() < 1900 || bd.getTime() > now())
+      throw err(400, 'FIELD_INVALID', 'Date of birth is not a real date.');
+    const address = str(b.address, 'Address', { min: 5, max: 200 });
+    const docNumber = String(b.docNumber ?? '').toUpperCase().replace(/[\s-]/g, '');
+    if (!rule.re.test(docNumber)) throw err(400, 'FIELD_INVALID', `Enter a valid ${rule.label}.`);
+    const front = image(b.docFront, 'Front of ID');
+    const back = rule.back ? image(b.docBack, 'Back of ID') : null;
+    const selfie = image(b.selfie, 'Selfie');
+    const docHash = require('node:crypto').createHmac('sha256', String(cfg.kycPepper)).update(`${b.docType}:${docNumber}`).digest('hex');
+
+    return tx(db, () => {
+      const subj = q('SELECT kyc_status FROM ' + subjTable(type) + ' WHERE id = ?').get(id);
+      if (subj.kyc_status === 'approved') throw err(409, 'ALREADY_VERIFIED', 'Your identity is already verified.');
+      if (subj.kyc_status === 'pending') throw err(409, 'KYC_PENDING', 'Your documents are already being reviewed.');
+      const ch = q('SELECT gesture, expires_at FROM kyc_challenges WHERE subject_type = ? AND subject_id = ?').get(type, id);
+      if (!ch || ch.expires_at <= now()) throw err(400, 'CHALLENGE_EXPIRED', 'The selfie instruction expired. Take the selfie again.');
+      // One person, one account: the same ID document cannot verify another account.
+      const dup = q(`SELECT 1 FROM kyc_submissions WHERE doc_hash = ? AND status IN ('pending','approved')
+                     AND NOT (subject_type = ? AND subject_id = ?)`).get(docHash, type, id);
+      if (dup) throw err(409, 'DOC_ALREADY_USED', 'This ID document is already used by another TsubuPay account.');
+      const r = q(`INSERT INTO kyc_submissions (subject_type, subject_id, doc_type, legal_name, birth_date, address, doc_hash, doc_last4,
+                   doc_front, doc_back, selfie, gesture, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
+        .run(type, id, b.docType, legalName, birthDate, address, docHash, docNumber.slice(-4), front, back, selfie, ch.gesture, now());
+      q(`UPDATE ${subjTable(type)} SET kyc_status = 'pending' WHERE id = ?`).run(id);
+      q('DELETE FROM kyc_challenges WHERE subject_type = ? AND subject_id = ?').run(type, id);
+      return { id: Number(r.lastInsertRowid), status: 'pending' };
+    });
+  }
+
+  function adminKycList({ status = 'pending', limit } = {}) {
+    const st = ['pending', 'approved', 'rejected'].includes(status) ? status : 'pending';
+    return q(`SELECT k.id, k.subject_type, k.subject_id, k.doc_type, k.legal_name, k.birth_date, k.address, k.doc_last4, k.gesture,
+                     k.status, k.reason, k.created_at, k.reviewed_at, (k.doc_back IS NOT NULL) has_back,
+                     (SELECT COUNT(*) FROM kyc_submissions o WHERE o.doc_hash = k.doc_hash
+                        AND NOT (o.subject_type = k.subject_type AND o.subject_id = k.subject_id)) other_accounts
+              FROM kyc_submissions k WHERE k.status = ? ORDER BY k.created_at ${st === 'pending' ? 'ASC' : 'DESC'} LIMIT ?`)
+      .all(st, clampLimit(limit)).map((r) => {
+        const acct = r.subject_type === 'user'
+          ? q('SELECT name, phone, phone_verified FROM users WHERE id = ?').get(r.subject_id)
+          : q('SELECT shop_name, email FROM merchants WHERE id = ?').get(r.subject_id);
+        return { id: r.id, subjectType: r.subject_type, subjectId: r.subject_id,
+          account: r.subject_type === 'user' ? `${acct.name} · ${acct.phone}${acct.phone_verified ? ' ✓' : ''}` : `${acct.shop_name} · ${acct.email}`,
+          docType: r.doc_type, legalName: r.legal_name, birthDate: r.birth_date, address: r.address, docLast4: r.doc_last4,
+          gesture: r.gesture, status: r.status, reason: r.reason, hasBack: !!r.has_back, otherAccounts: r.other_accounts,
+          createdAt: r.created_at, reviewedAt: r.reviewed_at };
+      });
+  }
+
+  function adminKycImage(id, which) {
+    const col = { front: 'doc_front', back: 'doc_back', selfie: 'selfie' }[which];
+    if (!col) throw err(400, 'FIELD_INVALID', 'which must be front, back or selfie.');
+    const r = q(`SELECT ${col} img FROM kyc_submissions WHERE id = ?`).get(Number(id));
+    if (!r || !r.img) throw err(404, 'NOT_FOUND', 'Image not found.');
+    const buf = Buffer.from(r.img);
+    return { buf, type: buf[0] === 0xff ? 'image/jpeg' : 'image/png' };
+  }
+
+  function adminKycReview(adminId, { id, decision, reason } = {}) {
+    if (decision !== 'approve' && decision !== 'reject') throw err(400, 'FIELD_INVALID', 'decision must be approve or reject.');
+    reason = decision === 'reject' ? str(reason, 'Reason', { min: 3, max: 200 }) : optStr(reason, 'Note', 200);
+    const out = tx(db, () => {
+      const k = q('SELECT * FROM kyc_submissions WHERE id = ?').get(Number(id));
+      if (!k) throw err(404, 'NOT_FOUND', 'Submission not found.');
+      if (k.status !== 'pending') throw err(409, 'ALREADY_REVIEWED', 'This submission was already reviewed.');
+      if (decision === 'approve' && q(`SELECT 1 FROM kyc_submissions WHERE doc_hash = ? AND status = 'approved' AND id <> ?`).get(k.doc_hash, k.id))
+        throw err(409, 'DOC_ALREADY_USED', 'This ID document already verified another account. Reject this one.');
+      const status = decision === 'approve' ? 'approved' : 'rejected';
+      q('UPDATE kyc_submissions SET status = ?, reason = ?, reviewed_by = ?, reviewed_at = ? WHERE id = ?').run(status, reason, adminId, now(), k.id);
+      q(`UPDATE ${subjTable(k.subject_type)} SET kyc_status = ? WHERE id = ?`).run(status, k.subject_id);
+      adminLog(adminId, decision === 'approve' ? 'kyc_approve' : 'kyc_reject', k.subject_type, k.subject_id, reason);
+      return { k, status };
+    });
+    events.emit(`${out.k.subject_type}:${out.k.subject_id}`, { type: 'kyc', status: out.status, reason });
+    return { id: out.k.id, status: out.status };
+  }
+
   // ---------- admin ----------
   function adminLog(adminId, action, targetType, targetId, reason) {
     q('INSERT INTO admin_log (admin_id, action, target_type, target_id, reason, created_at) VALUES (?, ?, ?, ?, ?, ?)')
@@ -601,6 +799,8 @@ function createService(db, opts = {}) {
     return {
       users: n('SELECT COUNT(*) n FROM users'), frozenUsers: n('SELECT COUNT(*) n FROM users WHERE frozen = 1'),
       merchants: n('SELECT COUNT(*) n FROM merchants'), frozenMerchants: n('SELECT COUNT(*) n FROM merchants WHERE frozen = 1'),
+      kycPending: n(`SELECT COUNT(*) n FROM kyc_submissions WHERE status = 'pending'`),
+      kycApproved: n(`SELECT COUNT(*) n FROM users WHERE kyc_status = 'approved'`) + n(`SELECT COUNT(*) n FROM merchants WHERE kyc_status = 'approved'`),
       today: {
         transactions: n('SELECT COUNT(*) n FROM transactions WHERE created_at >= ?', start),
         paymentVolume: n(`SELECT COALESCE(SUM(amount),0) n FROM transactions WHERE type = 'payment' AND created_at >= ?`, start),
@@ -617,21 +817,21 @@ function createService(db, opts = {}) {
 
   function adminUsers(search, limit) {
     const s = `%${String(search ?? '').trim()}%`;
-    return q(`SELECT u.id, u.phone, u.name, u.frozen, u.frozen_reason, u.created_at, a.balance FROM users u
+    return q(`SELECT u.id, u.phone, u.name, u.frozen, u.frozen_reason, u.created_at, u.kyc_status, a.balance FROM users u
               JOIN accounts a ON a.owner_type = 'user' AND a.owner_id = u.id
               WHERE u.phone LIKE ? OR u.name LIKE ? ORDER BY u.id DESC LIMIT ?`).all(s, s, clampLimit(limit))
-      .map((r) => ({ id: r.id, phone: r.phone, name: r.name, frozen: !!r.frozen, frozenReason: r.frozen_reason, balance: r.balance, createdAt: r.created_at }));
+      .map((r) => ({ id: r.id, phone: r.phone, name: r.name, frozen: !!r.frozen, frozenReason: r.frozen_reason, balance: r.balance, createdAt: r.created_at, kycStatus: r.kyc_status }));
   }
 
   function adminMerchants(search, limit) {
     const s = `%${String(search ?? '').trim()}%`;
-    return q(`SELECT m.id, m.email, m.shop_name, m.store_code, m.frozen, m.frozen_reason, m.created_at, a.balance,
+    return q(`SELECT m.id, m.email, m.shop_name, m.store_code, m.frozen, m.frozen_reason, m.created_at, m.kyc_status, a.balance,
                      (SELECT COUNT(*) FROM staff st WHERE st.merchant_id = m.id AND st.active = 1) staff
               FROM merchants m JOIN accounts a ON a.owner_type = 'merchant' AND a.owner_id = m.id
               WHERE m.shop_name LIKE ? OR m.email LIKE ? OR m.store_code LIKE ? ORDER BY m.id DESC LIMIT ?`)
       .all(s, s, s, clampLimit(limit))
       .map((r) => ({ id: r.id, email: r.email, shopName: r.shop_name, storeCode: r.store_code, frozen: !!r.frozen,
-        frozenReason: r.frozen_reason, balance: r.balance, staff: r.staff, createdAt: r.created_at }));
+        frozenReason: r.frozen_reason, balance: r.balance, staff: r.staff, createdAt: r.created_at, kycStatus: r.kyc_status }));
   }
 
   function adminTransactions({ type, search, limit } = {}) {
@@ -684,7 +884,8 @@ function createService(db, opts = {}) {
 
   return {
     cfg, events,
-    registerUser, registerMerchant, createAdmin, ensureAdmin, login, staffLogin, session, sessionSubject, logout,
+    registerUser, registerMerchant, createAdmin, ensureAdmin, requestPhoneCode, cancelPhoneCode,
+    kycChallenge, kycInfo, submitKyc, adminKycList, adminKycImage, adminKycReview, login, staffLogin, session, sessionSubject, logout,
     userProfile, merchantProfile, adminProfile,
     listStaff, createStaff, setStaffActive, resetStaffPassword,
     issuePayCode, chargeByCode, lookupStore, payStore, lookupRecipient, transfer,

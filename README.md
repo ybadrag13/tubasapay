@@ -11,8 +11,9 @@ A barcode and QR payment system in the style of PayPay. It has five parts: a **c
 - **Send money to friends** by phone number, with a PIN and an optional message.
 - **Admin dashboard:** customers, shops and transactions, money totals, a live ledger audit, and freezing accounts (with a permanent log of who did it and why).
 - **Receipts** for every payment, refund and transfer, which you can print, email or copy. Only the people involved (and admins) can open them.
+- **Identity verification (eKYC):** SMS code at sign-up (one phone number = one account), ID document photos plus a **live selfie** with a random gesture, **one person = one account** (the same ID can't verify two accounts), and **admin review** before anyone can pay, top up, send money or take payments.
 - **Permanent storage with Turso** (free, no card), so data survives restarts on free hosting.
-- **54 automated tests**, including race conditions, double-spending, expiry, refunds, roles, freezing, receipts, database upgrades, and surviving a restart through Turso.
+- **71 automated tests**, including identity checks, race conditions, double-spending, expiry, refunds, roles, freezing, receipts, database upgrades, and surviving a restart through Turso.
 
 > **Prototype notice.** Top-ups and payouts are *simulated*: no bank is connected. Running real money in Japan requires registration as a 資金移動業者 or 前払式支払手段 issuer under the 資金決済法, along with KYC (identity checks), anti-money-laundering controls and a security audit. See "Going to production" below.
 
@@ -25,7 +26,7 @@ Requires **Node.js 22.5 or newer** (check with `node --version`).
 ```bash
 cd tsubupay
 npm start           # starts on http://localhost:3000
-npm test            # runs the 54 tests
+npm test            # runs the 71 tests
 npm run audit-ledger
 npm run create-admin -- you@example.com "a-long-password"   # make an admin account (12+ character password)
 ```
@@ -163,15 +164,33 @@ Setup:
 | Code lifetime / refresh | 3 min / 1 min |
 | Max per transfer to a friend | ¥100,000 (free) |
 
+### Identity verification (KYC)
+1. **Phone:** sign-up sends a 6-digit SMS code (5 minutes, 5 tries, one per minute). A phone number can only ever have one account.
+2. **Document:** driver's licence, residence card or passport, with photos of the front (and back), plus legal name, date of birth and address.
+3. **Live selfie:** taken with the camera inside the app (uploads are refused), showing a **random gesture the server chose** (for example "touch your left ear"), so an old photo can't be reused.
+4. **One person, one account:** the document number is never stored. Only a keyed fingerprint (HMAC with `TSUBU_KYC_PEPPER`) and the last 4 characters are kept, and a fingerprint already pending or approved on another account is refused.
+5. **Review:** an admin compares the selfie with the ID in the **Verification** tab, then approves or rejects with a reason. The person sees the result live and can try again after a rejection. Every decision goes in the admin log.
+
+Until approved, customers can't show a pay code, top up, pay a shop, send or receive money, and shops can't take payments or pay out. Only the shop **owner** can verify a shop.
+
+| Setting | Meaning |
+|---|---|
+| `TSUBU_KYC_PEPPER` | **Required in production.** A long random secret for the ID fingerprints. Never change it, or duplicate detection resets. Make one with `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
+| `TSUBU_SMS_PROVIDER` | `demo` (default: the code is shown on screen and no SMS is sent, so **not real phone verification**) or `twilio` |
+| `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM` | For real SMS through Twilio (paid; trial credit available) |
+
+**Honest limits:** faces are compared by a person, not by AI. For real money in Japan, 犯収法's online identity method (ホ方式) requires more than this prototype does, such as a video showing the card's thickness and security features, or reading the IC chip. Use a licensed eKYC provider (for example TRUSTDOCK or Liquid) before launching. ID photos are sensitive personal data under 個人情報保護法: only admins can view them, and they are never sent to anyone else.
+
 ### Who can do what
 | Action | Customer | Cashier | Shop owner | Admin |
 |---|:-:|:-:|:-:|:-:|
-| Pay, top up, send money | ✓ | | | |
+| Pay, top up, send money (after identity check) | ✓ | | | |
 | Take payments (register, store QR) | | ✓ | ✓ | |
 | See sales list | | ✓ (no fees) | ✓ | ✓ |
 | See balance and fees, refund, pay out | | | ✓ | |
 | Add, deactivate or reset staff | | | ✓ | |
 | See any receipt, freeze or unfreeze accounts | | | | ✓ |
+| Approve or reject identity checks | | | | ✓ |
 
 A **frozen customer** can log in and see their history, but cannot pay, top up, send or receive money. A **frozen shop** cannot take payments or pay out, but it *can* still refund, because returning money to customers is always safe. Deactivating a cashier logs them out on every device immediately.
 
@@ -185,7 +204,8 @@ tsubupay/
 │   ├── server.js     HTTP server: routes, cookies, CSRF, rate limits, live events, static files
 │   ├── service.js    all money rules (payments, refunds, top-ups, payouts, audit)
 │   ├── db.js         SQLite schema, migrations, transaction helper
-│   ├── store.js      Turso sync: restore on start, copy every write, flush on shutdown
+│   ├── store.js      Turso sync: restore on start, copy every write, flush on shutdown, upgrade old Turso schemas
+│   ├── sms.js        sign-up SMS codes: demo mode or Twilio
 │   └── util.js       hashing, code generation, Luhn, rate limiter
 ├── public/
 │   ├── index.html    landing page
@@ -194,12 +214,12 @@ tsubupay/
 │   ├── admin/        admin dashboard (index.html, admin.js)
 │   ├── receipt/      receipt page (index.html, receipt.js)
 │   └── lib/          codes.js (barcode + QR), common.js (API, UI, scanner), styles.css
-├── test/             api (27), features (16), codes (6), turso (5) + fake-turso.js
+├── test/             api (27), features (18), codes (6), turso (7), kyc (13) + fake-turso.js
 └── scripts/          audit.js, create-admin.js, verify_codes.py (optional OpenCV check)
 ```
 
 ### Database tables
-`users`, `merchants`, `staff`, `admins`, `admin_log`, `accounts` (one per user, shop, the platform, and "external" for the bank side), `transactions`, `entries` (ledger lines), `pay_codes`, `sessions`, `idempotency`. The schema version is stored in `PRAGMA user_version` (currently 2); upgrades live in `MIGRATIONS` in `server/db.js`.
+`users`, `merchants`, `staff`, `admins`, `admin_log`, `accounts` (one per user, shop, the platform, and "external" for the bank side), `transactions`, `entries` (ledger lines), `pay_codes`, `sessions`, `idempotency`. The schema version is stored in `PRAGMA user_version` (currently 3). Version 3 adds `phone_otps`, `kyc_challenges` and `kyc_submissions`; upgrades live in `MIGRATIONS` in `server/db.js`.
 
 ---
 
@@ -210,7 +230,11 @@ Every `POST` needs the headers `Content-Type: application/json` and `X-Tsubu-Cli
 **Customer** (`tp_user` cookie)
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| POST | `/api/user/register` | `phone, name, password, pin` | logs in |
+| POST | `/api/user/otp` | `phone` | sends the SMS code (`demoCode` in demo mode) |
+| POST | `/api/user/register` | `phone, otp, name, password, pin` | logs in |
+| GET | `/api/user/kyc` | | identity check status and last reason |
+| POST | `/api/user/kyc/challenge` | | random selfie gesture (15 minutes) |
+| POST | `/api/user/kyc` | `docType, legalName, birthDate, address, docNumber, docFront, docBack?, selfie` | images as JPEG/PNG data URLs, max 1.5 MB each |
 | POST | `/api/user/login` | `phone, password` | |
 | POST | `/api/user/logout` | | |
 | GET | `/api/user/me` | | profile + balance |
@@ -253,8 +277,11 @@ Every `POST` needs the headers `Content-Type: application/json` and `X-Tsubu-Cli
 | GET | `/api/admin/transactions` | `?type=` and `?q=` (ID) |
 | POST | `/api/admin/freeze` | `kind` (user or merchant), `id, frozen, reason` (reason required to freeze) |
 | GET | `/api/admin/log` | |
+| GET | `/api/admin/kyc` | `?status=pending|approved|rejected` (no images) |
+| GET | `/api/admin/kyc/image` | `?id=&which=front|back|selfie` (admins only, never cached) |
+| POST | `/api/admin/kyc/review` | `id, decision (approve or reject), reason (required to reject)` |
 
-Error codes include `OWNER_ONLY`, `ACCOUNT_FROZEN`, `STORE_UNAVAILABLE`, `RECIPIENT_NOT_FOUND`, `RECIPIENT_UNAVAILABLE`, `SELF_TRANSFER`, `RECIPIENT_WALLET_LIMIT`, `CODE_INVALID`, `CODE_NOT_FOUND`, `CODE_USED`, `CODE_EXPIRED`, `INSUFFICIENT_FUNDS`, `PIN_WRONG`, `PIN_LOCKED`, `ALREADY_REFUNDED`, `MERCHANT_FUNDS_LOW`, `WALLET_LIMIT`, `IDEMPOTENCY_MISMATCH`, `RATE_LIMITED` and `CSRF`.
+Error codes include `KYC_REQUIRED`, `DOC_ALREADY_USED`, `OTP_WRONG`, `OTP_LOCKED`, `CHALLENGE_EXPIRED`, `OWNER_ONLY`, `ACCOUNT_FROZEN`, `STORE_UNAVAILABLE`, `RECIPIENT_NOT_FOUND`, `RECIPIENT_UNAVAILABLE`, `SELF_TRANSFER`, `RECIPIENT_WALLET_LIMIT`, `CODE_INVALID`, `CODE_NOT_FOUND`, `CODE_USED`, `CODE_EXPIRED`, `INSUFFICIENT_FUNDS`, `PIN_WRONG`, `PIN_LOCKED`, `ALREADY_REFUNDED`, `MERCHANT_FUNDS_LOW`, `WALLET_LIMIT`, `IDEMPOTENCY_MISMATCH`, `RATE_LIMITED` and `CSRF`.
 
 ---
 
@@ -263,7 +290,7 @@ Error codes include `OWNER_ONLY`, `ACCOUNT_FROZEN`, `STORE_UNAVAILABLE`, `RECIPI
 Be honest with anyone you show this to: TsubuPay is a correct, well-tested **prototype**, not a licensed payment service. A real launch needs:
 
 1. **Licence and law:** registration under the 資金決済法 (資金移動業, or 前払式支払手段 for prepaid-only), terms of service, a privacy policy, and protection of customer funds (供託 or a trust).
-2. **Identity checks (KYC/eKYC)** and anti-money-laundering monitoring under 犯収法.
+2. **A licensed eKYC provider** (ホ方式 or IC-chip reading) in place of the prototype's manual review, plus anti-money-laundering monitoring under 犯収法.
 3. **Real bank connections** for top-ups (bank API or Pay-easy) and shop payouts (全銀 transfers), with daily reconciliation against the ledger.
 4. **Infrastructure:** PostgreSQL with replication and backups instead of one SQLite file; several servers with shared rate limits and events (for example Redis); monitoring and alerts.
 5. **Stronger authentication:** SMS or app 2FA for customers, owners and especially admins, device binding, and admin roles (viewer vs operator).

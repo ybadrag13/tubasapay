@@ -11,7 +11,7 @@ const clock = () => Date.now() + clockOffset;
 
 let app, base;
 test.before(async () => {
-  app = createApp({ dbPath: ':memory:', service: { clock }, limits: { login: 1000, register: 1000, chargeFail: 1000 } });
+  app = createApp({ dbPath: ':memory:', service: { clock, requireKyc: false, requirePhoneOtp: false }, limits: { login: 1000, register: 1000, chargeFail: 1000 } });
   await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
   base = `http://127.0.0.1:${app.server.address().port}`;
 });

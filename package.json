@@ -1,6 +1,6 @@
 {
   "name": "tsubupay",
-  "version": "2.2.0",
+  "version": "3.0.0",
   "description": "TsubuPay: a QR and barcode payment system with a customer app and a shop app. Zero dependencies.",
   "private": true,
   "license": "MIT",

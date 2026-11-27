@@ -1,7 +1,7 @@
 // TsubuPay customer app
 (function () {
   'use strict';
-  const { api, newKey, h, $, setSvg, yen, when, toast, confirmBox, resultScreen, chime, listen, Scanner } = window.Tsubu;
+  const { api, newKey, h, $, setSvg, yen, when, toast, confirmBox, resultScreen, chime, listen, Scanner, kycScreen } = window.Tsubu;
   const view = $('#view');
   const logoutBtn = $('#logout');
 
@@ -21,33 +21,64 @@
     logoutBtn.hidden = true;
     const err = errorLine();
     const field = (lab, attrs) => [h('label', { for: attrs.id }, lab), h('input', attrs)];
-    const form = h('form', { novalidate: true },
-      mode === 'signup' ? field('Your name', { id: 'name', autocomplete: 'name', maxlength: 40, required: true }) : null,
-      field('Phone number', { id: 'phone', inputmode: 'numeric', autocomplete: 'tel', placeholder: '09012345678', maxlength: 11 }),
-      field('Password', { id: 'password', type: 'password', autocomplete: mode === 'signup' ? 'new-password' : 'current-password', minlength: 8 }),
-      mode === 'signup' ? field('4-digit payment PIN', { id: 'pin', type: 'password', inputmode: 'numeric', maxlength: 4, autocomplete: 'off' }) : null,
-      mode === 'signup' ? h('p', { class: 'muted' }, 'Password: 8+ characters. PIN: used to confirm payments when you scan a shop\'s QR.') : null,
-      err,
-      h('button', { class: 'btn', type: 'submit' }, mode === 'signup' ? 'Create account' : 'Log in'));
+    const tabs = h('div', { class: 'tabs', role: 'tablist' },
+      h('button', { class: mode === 'login' ? 'active' : '', onclick: () => authView('login') }, 'Log in'),
+      h('button', { class: mode === 'signup' ? 'active' : '', onclick: () => authView('signup') }, 'Sign up'));
+    const v = (form, id) => form.querySelector('#' + id)?.value ?? '';
 
+    if (mode === 'login') {
+      const form = h('form', { novalidate: true },
+        field('Phone number', { id: 'phone', inputmode: 'numeric', autocomplete: 'tel', placeholder: '09012345678', maxlength: 13 }),
+        field('Password', { id: 'password', type: 'password', autocomplete: 'current-password' }),
+        err, h('button', { class: 'btn', type: 'submit' }, 'Log in'));
+      form.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const btn = form.querySelector('button[type=submit]'); btn.disabled = true; err.textContent = '';
+        try { me = await api('POST', '/api/user/login', { phone: v(form, 'phone').replace(/\D/g, ''), password: v(form, 'password') }); start(); }
+        catch (ex) { err.textContent = ex.message; btn.disabled = false; }
+      });
+      return show(h('div', { class: 'card' }, tabs, form));
+    }
+
+    // Sign-up step 1: prove you own the phone number with an SMS code.
+    const phone = h('input', { id: 'phone', inputmode: 'numeric', autocomplete: 'tel', placeholder: '09012345678', maxlength: 13 });
+    const send = h('button', { class: 'btn secondary', type: 'button' }, 'Send SMS code');
+    const step2 = h('div', { hidden: true });
+    send.addEventListener('click', async () => {
+      err.textContent = ''; send.disabled = true;
+      const p = phone.value.replace(/\D/g, '');
+      try {
+        const r = await api('POST', '/api/user/otp', { phone: p });
+        phone.readOnly = true; step2.hidden = false;
+        send.textContent = 'Send again'; setTimeout(() => { send.disabled = false; }, 60_000);
+        const demo = $('#otp-demo');
+        if (r.demo) demo.replaceChildren('Demo mode, no real SMS sent. Your code is ', h('b', {}, r.demoCode));
+        demo.hidden = !r.demo;
+        toast(r.demo ? 'Demo: code shown below.' : `Code sent by SMS to ${p}.`);
+        $('#otp').focus();
+      } catch (ex) { err.textContent = ex.message; send.disabled = false; }
+    });
+    step2.append(
+      h('div', { class: 'otp-demo', id: 'otp-demo', hidden: true }),
+      ...field('6-digit SMS code', { id: 'otp', inputmode: 'numeric', autocomplete: 'one-time-code', maxlength: 6 }),
+      ...field('Your name', { id: 'name', autocomplete: 'name', maxlength: 40 }),
+      ...field('Password', { id: 'password', type: 'password', autocomplete: 'new-password', minlength: 8 }),
+      ...field('4-digit payment PIN', { id: 'pin', type: 'password', inputmode: 'numeric', maxlength: 4, autocomplete: 'off' }),
+      h('p', { class: 'muted' }, 'Password: 8+ characters. PIN: confirms payments. One phone number can have one account.'),
+      h('button', { class: 'btn', type: 'submit' }, 'Create account'));
+    const form = h('form', { novalidate: true },
+      h('label', { for: 'phone' }, 'Phone number'), h('div', { class: 'row' }, phone, send), step2, err);
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const btn = form.querySelector('button[type=submit]');
-      btn.disabled = true; err.textContent = '';
-      const v = (id) => form.querySelector('#' + id)?.value ?? '';
+      if (step2.hidden) return send.click();
+      const btn = form.querySelector('button[type=submit]'); btn.disabled = true; err.textContent = '';
       try {
-        me = mode === 'signup'
-          ? await api('POST', '/api/user/register', { name: v('name'), phone: v('phone').replace(/\D/g, ''), password: v('password'), pin: v('pin') })
-          : await api('POST', '/api/user/login', { phone: v('phone').replace(/\D/g, ''), password: v('password') });
+        me = await api('POST', '/api/user/register', { phone: phone.value.replace(/\D/g, ''), otp: v(form, 'otp').trim(),
+          name: v(form, 'name'), password: v(form, 'password'), pin: v(form, 'pin') });
         start();
       } catch (ex) { err.textContent = ex.message; btn.disabled = false; }
     });
-
-    show(h('div', { class: 'card' },
-      h('div', { class: 'tabs', role: 'tablist' },
-        h('button', { class: mode === 'login' ? 'active' : '', onclick: () => authView('login') }, 'Log in'),
-        h('button', { class: mode === 'signup' ? 'active' : '', onclick: () => authView('signup') }, 'Sign up')),
-      form));
+    show(h('div', { class: 'card' }, tabs, form));
   }
 
   // ================= home: balance + rotating code =================
@@ -62,24 +93,32 @@
 
     const frozen = me.frozen ? h('div', { class: 'banner', role: 'alert' },
       'Your account is frozen, so payments are paused. Please contact TsubuPay support.') : null;
+    const verified = me.kycStatus === 'approved';
+    const kycText = { none: 'Verify your identity to start paying. It takes about 3 minutes.',
+      pending: 'Your identity check is under review. Payments unlock as soon as it is approved.',
+      rejected: 'Your identity check was not approved. Please try again.' }[me.kycStatus];
+    const kycBanner = verified ? null : h('div', { class: 'card kyc-banner', id: 'kyc-banner' },
+      h('div', {}, h('div', { class: 'title' }, me.kycStatus === 'pending' ? '⏳ Under review' : '🪪 Identity check needed'), h('div', { class: 'muted' }, kycText)),
+      h('button', { class: 'btn small', onclick: verifyView }, me.kycStatus === 'pending' ? 'View' : 'Verify now'));
+    const locked = me.frozen || !verified;
     show(
-      frozen,
+      frozen, kycBanner,
       h('div', { class: 'card' },
         h('div', { class: 'row between' },
           h('div', {}, h('div', { class: 'balance-label' }, 'Balance'), balanceEl),
           h('div', { class: 'muted', 'aria-label': 'Account name' }, me.name))),
-      me.frozen ? null : h('div', { class: 'card paycard' },
+      locked ? null : h('div', { class: 'card paycard' },
         h('div', { class: 'balance-label' }, 'Show this at the register'),
         bar, digits, qr,
         h('div', { class: 'timer' }, timerFill), timerText,
         h('button', { class: 'btn secondary small', onclick: refreshCode }, '↻ New code')),
       h('div', { class: 'actions four' },
-        h('button', { class: 'action', onclick: scanView, disabled: me.frozen }, h('span', { class: 'ico' }, '⌗'), 'Scan'),
-        h('button', { class: 'action', onclick: sendView, disabled: me.frozen }, h('span', { class: 'ico' }, '↗'), 'Send'),
-        h('button', { class: 'action', onclick: topupView, disabled: me.frozen }, h('span', { class: 'ico' }, '+'), 'Top up'),
+        h('button', { class: 'action', onclick: scanView, disabled: locked }, h('span', { class: 'ico' }, '⌗'), 'Scan'),
+        h('button', { class: 'action', onclick: sendView, disabled: locked }, h('span', { class: 'ico' }, '↗'), 'Send'),
+        h('button', { class: 'action', onclick: topupView, disabled: locked }, h('span', { class: 'ico' }, '+'), 'Top up'),
         h('button', { class: 'action', onclick: historyView }, h('span', { class: 'ico' }, '≡'), 'History')));
 
-    if (!me.frozen) refreshCode();
+    if (!locked) refreshCode();
   }
 
   async function refreshCode() {
@@ -106,7 +145,7 @@
       codeTimer = setTimeout(refreshCode, REFRESH_MS);
     } catch (ex) {
       if (ex.status === 401) return authView();
-      if (ex.code === 'ACCOUNT_FROZEN') return reloadMe();
+      if (ex.code === 'ACCOUNT_FROZEN' || ex.code === 'KYC_REQUIRED') return reloadMe();
       tText.textContent = ex.message + ' Tap "New code" to retry.';
       codeTimer = setTimeout(refreshCode, 10_000);
     }
@@ -123,10 +162,10 @@
 
   async function reloadMe() {
     try {
-      const wasFrozen = me?.frozen;
+      const was = `${me?.frozen}|${me?.kycStatus}`;
       me = await api('GET', '/api/user/me');
       const b = $('#balance'); if (b) b.textContent = yen(me.balance);
-      if (b && wasFrozen !== me.frozen) home();
+      if (b && was !== `${me.frozen}|${me.kycStatus}`) home();
     }
     catch (ex) { if (ex.status === 401) authView(); }
   }
@@ -264,6 +303,13 @@
     });
   }
 
+  // ================= identity verification =================
+  function verifyView() {
+    logoutBtn.hidden = false;
+    stopCode();
+    kycScreen(view, { base: '/api/user', onBack: async () => { await reloadMe(); home(); }, who: 'you' });
+  }
+
   // ================= send money to a friend =================
   function sendView() {
     const err = errorLine();
@@ -369,6 +415,13 @@
         toast(`Received ${yen(tx.amount)} from ${tx.customerName}${tx.note ? ': “' + tx.note + '”' : ''}`, 5000);
       },
       topup: () => reloadMe(),
+      kyc: async ({ status, reason }) => {
+        await reloadMe();
+        chime(status === 'approved');
+        toast(status === 'approved' ? '✓ Identity verified. Payments are unlocked.' : `Identity check not approved: ${reason || ''}`, 6000);
+        if (!$('#balance')) return;
+        home();
+      },
     });
     home();
   }

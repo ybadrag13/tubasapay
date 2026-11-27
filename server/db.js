@@ -184,6 +184,56 @@ const MIGRATIONS = {
     CREATE INDEX tx_merchant ON transactions(merchant_id, created_at);
     CREATE INDEX tx_created ON transactions(created_at);
   `,
+
+  // v3: identity verification (KYC) and phone codes. Only adds columns and tables.
+  3: `
+    ALTER TABLE users ADD COLUMN kyc_status TEXT NOT NULL DEFAULT 'none';
+    ALTER TABLE users ADD COLUMN phone_verified INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE merchants ADD COLUMN kyc_status TEXT NOT NULL DEFAULT 'none';
+
+    CREATE TABLE phone_otps (
+      phone       TEXT    PRIMARY KEY,
+      code_hash   TEXT    NOT NULL,
+      attempts    INTEGER NOT NULL DEFAULT 0,
+      expires_at  INTEGER NOT NULL,
+      created_at  INTEGER NOT NULL
+    );
+
+    -- The random gesture a person must show in their live selfie.
+    CREATE TABLE kyc_challenges (
+      subject_type TEXT    NOT NULL,
+      subject_id   INTEGER NOT NULL,
+      gesture      TEXT    NOT NULL,
+      expires_at   INTEGER NOT NULL,
+      PRIMARY KEY (subject_type, subject_id)
+    );
+
+    -- ID document numbers are never stored: only a keyed hash (to stop one
+    -- person verifying several accounts) and the last 4 characters for staff.
+    CREATE TABLE kyc_submissions (
+      id           INTEGER PRIMARY KEY,
+      subject_type TEXT    NOT NULL CHECK (subject_type IN ('user','merchant')),
+      subject_id   INTEGER NOT NULL,
+      doc_type     TEXT    NOT NULL CHECK (doc_type IN ('drivers_license','residence_card','passport')),
+      legal_name   TEXT    NOT NULL,
+      birth_date   TEXT    NOT NULL,
+      address      TEXT    NOT NULL,
+      doc_hash     TEXT    NOT NULL,
+      doc_last4    TEXT    NOT NULL,
+      doc_front    BLOB    NOT NULL,
+      doc_back     BLOB,
+      selfie       BLOB    NOT NULL,
+      gesture      TEXT    NOT NULL,
+      status       TEXT    NOT NULL CHECK (status IN ('pending','approved','rejected')),
+      reason       TEXT,
+      reviewed_by  INTEGER REFERENCES admins(id),
+      reviewed_at  INTEGER,
+      created_at   INTEGER NOT NULL
+    );
+    CREATE INDEX kyc_subject ON kyc_submissions(subject_type, subject_id, created_at);
+    CREATE INDEX kyc_doc ON kyc_submissions(doc_hash);
+    CREATE INDEX kyc_queue ON kyc_submissions(status, created_at);
+  `,
 };
 const LATEST = Math.max(...Object.keys(MIGRATIONS).map(Number));
 
@@ -239,4 +289,4 @@ function tx(db, fn) {
   }
 }
 
-module.exports = { open, tx, LATEST };
+module.exports = { open, tx, LATEST, MIGRATIONS };

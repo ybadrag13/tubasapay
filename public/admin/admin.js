@@ -37,7 +37,72 @@
   function go(t) {
     tab = t;
     for (const b of nav.querySelectorAll('button')) b.classList.toggle('active', b.dataset.tab === t);
-    ({ overview, users, shops, txs, log })[t]();
+    ({ overview, kyc, users, shops, txs, log })[t]();
+    refreshKycCount();
+  }
+
+  async function refreshKycCount() {
+    try {
+      const o = await api('GET', '/api/admin/kyc?status=pending&limit=200');
+      const el = $('#kyc-count'); if (el) el.textContent = o.items.length ? String(o.items.length) : '';
+    } catch { /* ignore */ }
+  }
+  const kycStatus = (st) => h('span', { class: 'status ' + (st === 'approved' ? 'ok' : st === 'pending' ? 'wait' : 'bad') },
+    { approved: 'Verified', pending: 'Pending', rejected: 'Rejected', none: 'Not verified' }[st] || st);
+  const DOC = { drivers_license: "Driver's licence", residence_card: 'Residence card', passport: 'Passport' };
+  const age = (d) => { const b = new Date(d + 'T00:00:00Z'), n = new Date(); let a = n.getUTCFullYear() - b.getUTCFullYear();
+    if (n.getUTCMonth() < b.getUTCMonth() || (n.getUTCMonth() === b.getUTCMonth() && n.getUTCDate() < b.getUTCDate())) a--; return a; };
+
+  // ---------- identity verification queue ----------
+  function kyc() {
+    const status = h('select', { id: 'kyc-status', 'aria-label': 'Status' },
+      [['pending', 'Waiting for review'], ['approved', 'Approved'], ['rejected', 'Rejected']].map(([v, l]) => h('option', { value: v }, l)));
+    const listBox = h('ul', { class: 'list' });
+    const detail = h('div', { class: 'card' }, h('p', { class: 'muted' }, 'Choose a submission on the left.'));
+    const open = (k) => {
+      const img = (which, label) => h('figure', {}, h('figcaption', {}, label),
+        h('img', { src: `/api/admin/kyc/image?id=${k.id}&which=${which}`, alt: label, loading: 'lazy' }));
+      const reason = h('input', { id: 'kyc-reason', maxlength: 200, placeholder: 'Reason (required to reject), e.g. selfie gesture missing' });
+      const decide = async (decision) => {
+        if (decision === 'approve' && !(await confirmBox({ title: `Approve ${k.legalName}?`, body: 'Only approve if the selfie clearly shows the same person as the ID photo, doing the requested gesture, and the details match the document.', ok: 'Approve' }))) return;
+        try {
+          await api('POST', '/api/admin/kyc/review', { id: k.id, decision, reason: reason.value.trim() });
+          toast(decision === 'approve' ? `${k.legalName} verified.` : 'Rejected. The person sees your reason and can try again.');
+          kyc();
+        } catch (ex) { if (!onAuthError(ex)) toast(ex.message, 5000); }
+      };
+      detail.replaceChildren(...[
+        h('div', { class: 'row between' }, h('h2', {}, k.legalName), kycStatus(k.status)),
+        k.otherAccounts ? h('div', { class: 'warn' }, `⚠ This ID number was also submitted by ${k.otherAccounts} other account(s). Check carefully.`) : null,
+        h('dl', { class: 'kv' },
+          h('dt', {}, 'Account'), h('dd', {}, `${k.subjectType === 'user' ? 'Customer' : 'Shop owner'} · ${k.account}`),
+          h('dt', {}, 'Document'), h('dd', {}, `${DOC[k.docType]} · ends ${k.docLast4}`),
+          h('dt', {}, 'Date of birth'), h('dd', {}, `${k.birthDate} (age ${age(k.birthDate)})`),
+          h('dt', {}, 'Address'), h('dd', {}, k.address),
+          h('dt', {}, 'Selfie must show'), h('dd', {}, h('b', {}, k.gesture)),
+          h('dt', {}, 'Submitted'), h('dd', {}, when(k.createdAt))),
+        h('p'),
+        h('div', { class: 'kyc-imgs' }, img('selfie', 'Live selfie'), img('front', 'ID front'), k.hasBack ? img('back', 'ID back') : null),
+        h('p', { class: 'muted' }, 'Check: same face on selfie and ID · gesture is correct · name, date of birth and address match the document · ID looks genuine and unexpired.'),
+        k.status === 'pending' ? h('div', {}, h('label', { for: 'kyc-reason' }, 'Reason'), reason, h('p'),
+          h('div', { class: 'grid2' }, h('button', { class: 'btn danger', onclick: () => decide('reject') }, 'Reject'),
+            h('button', { class: 'btn', onclick: () => decide('approve') }, 'Approve'))) : h('p', { class: 'muted' }, k.reason ? `Note: ${k.reason}` : ''),
+      ].filter(Boolean));
+    };
+    const load = async () => {
+      try {
+        const { items } = await api('GET', '/api/admin/kyc?limit=200&status=' + status.value);
+        listBox.replaceChildren(...(items.length ? items.map((k) => h('li', { class: 'clickable', onclick: () => open(k) },
+          h('div', {}, h('div', { class: 'title' }, k.legalName, k.otherAccounts ? h('span', { class: 'tag refund' }, 'DUPLICATE ID') : null),
+            h('div', { class: 'sub' }, `${k.subjectType === 'user' ? 'Customer' : 'Shop'} · ${DOC[k.docType]} · ${when(k.createdAt)}`)),
+          kycStatus(k.status))) : [h('li', { class: 'empty' }, status.value === 'pending' ? 'Nothing waiting. All caught up.' : 'Nothing here.')]));
+        if (items.length) open(items[0]);
+        else detail.replaceChildren(h('p', { class: 'muted' }, 'Nothing selected.'));
+      } catch (ex) { if (!onAuthError(ex)) listBox.replaceChildren(h('li', { class: 'empty' }, ex.message)); }
+    };
+    status.addEventListener('change', load);
+    show(h('div', { class: 'kyc-admin' }, h('div', { class: 'card' }, h('h2', {}, 'Identity checks'), h('div', { class: 'toolbar' }, status), listBox), detail));
+    load();
   }
 
   // ---------- overview ----------
@@ -49,7 +114,8 @@
       show(
         h('div', { class: 'card' }, h('h2', {}, 'Accounts'), h('div', { class: 'stats' },
           stat('Customers', String(o.users)), stat('Frozen customers', String(o.frozenUsers)),
-          stat('Shops', String(o.merchants)), stat('Frozen shops', String(o.frozenMerchants)))),
+          stat('Shops', String(o.merchants)), stat('Frozen shops', String(o.frozenMerchants)),
+          stat('Verified (KYC)', String(o.kycApproved)), stat('Waiting for review', String(o.kycPending)))),
         h('div', { class: 'card' }, h('h2', {}, 'Today (JST)'), h('div', { class: 'stats' },
           stat('Transactions', String(o.today.transactions)), stat('Payment volume', yen(o.today.paymentVolume)),
           stat('Transfer volume', yen(o.today.transferVolume)))),
@@ -92,8 +158,8 @@
     const load = async () => {
       try {
         const { items } = await api('GET', '/api/admin/users?limit=200&q=' + encodeURIComponent(search.value));
-        box.replaceChildren(table(['ID', 'Name', 'Phone', 'Balance', 'Joined', 'Status', ''], items.map((u) => h('tr', {},
-          num(String(u.id)), h('td', {}, u.name), h('td', {}, u.phone), num(yen(u.balance)), h('td', {}, when(u.createdAt)),
+        box.replaceChildren(table(['ID', 'Name', 'Phone', 'Identity', 'Balance', 'Joined', 'Status', ''], items.map((u) => h('tr', {},
+          num(String(u.id)), h('td', {}, u.name), h('td', {}, u.phone), h('td', {}, kycStatus(u.kycStatus)), num(yen(u.balance)), h('td', {}, when(u.createdAt)),
           h('td', { title: u.frozenReason || '' }, status(u.frozen), u.frozenReason ? h('div', { class: 'sub muted' }, u.frozenReason) : null),
           h('td', {}, h('button', { class: 'btn ghost small', onclick: () => setFrozen('user', u.id, u.name, !u.frozen) }, u.frozen ? 'Unfreeze' : 'Freeze'))))));
       } catch (ex) { if (!onAuthError(ex)) box.replaceChildren(h('p', { class: 'empty' }, ex.message)); }
@@ -110,8 +176,8 @@
     const load = async () => {
       try {
         const { items } = await api('GET', '/api/admin/merchants?limit=200&q=' + encodeURIComponent(search.value));
-        box.replaceChildren(table(['ID', 'Shop', 'Store code', 'Email', 'Staff', 'Balance', 'Status', ''], items.map((m) => h('tr', {},
-          num(String(m.id)), h('td', {}, m.shopName), h('td', {}, m.storeCode), h('td', {}, m.email), num(String(m.staff)), num(yen(m.balance)),
+        box.replaceChildren(table(['ID', 'Shop', 'Store code', 'Email', 'Owner ID', 'Staff', 'Balance', 'Status', ''], items.map((m) => h('tr', {},
+          num(String(m.id)), h('td', {}, m.shopName), h('td', {}, m.storeCode), h('td', {}, m.email), h('td', {}, kycStatus(m.kycStatus)), num(String(m.staff)), num(yen(m.balance)),
           h('td', {}, status(m.frozen), m.frozenReason ? h('div', { class: 'sub muted' }, m.frozenReason) : null),
           h('td', {}, h('button', { class: 'btn ghost small', onclick: () => setFrozen('merchant', m.id, m.shopName, !m.frozen) }, m.frozen ? 'Unfreeze' : 'Freeze'))))));
       } catch (ex) { if (!onAuthError(ex)) box.replaceChildren(h('p', { class: 'empty' }, ex.message)); }
@@ -151,7 +217,7 @@
     try {
       const { items } = await api('GET', '/api/admin/log?limit=200');
       show(h('div', { class: 'card' }, h('h2', {}, 'Admin log'),
-        h('p', { class: 'muted' }, 'Every freeze and unfreeze is recorded here permanently.'),
+        h('p', { class: 'muted' }, 'Every freeze, unfreeze and identity decision is recorded here permanently.'),
         table(['Time', 'Admin', 'Action', 'Target', 'Reason'], items.map((l) => h('tr', {},
           h('td', {}, when(l.createdAt)), h('td', {}, l.admin), h('td', {}, l.action),
           h('td', {}, `${l.targetType === 'user' ? 'Customer' : 'Shop'} #${l.targetId}`), h('td', {}, l.reason || '—'))))));

@@ -10,7 +10,7 @@ const { open } = require('../server/db');
 
 let app, base;
 test.before(async () => {
-  app = createApp({ dbPath: ':memory:', limits: { login: 1000, register: 1000, chargeFail: 1000, lookup: 1000, adminLogin: 1000 } });
+  app = createApp({ dbPath: ':memory:', service: { requireKyc: false, requirePhoneOtp: false }, limits: { login: 1000, register: 1000, chargeFail: 1000, lookup: 1000, adminLogin: 1000 } });
   await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
   base = `http://127.0.0.1:${app.server.address().port}`;
 });
@@ -301,7 +301,8 @@ test('migration: an old (v1) database upgrades with all data and balances kept',
   old.close();
 
   const db = open(file); // runs the migration
-  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 2);
+  assert.equal(db.prepare('PRAGMA user_version').get().user_version, 3);
+  assert.equal(db.prepare(`SELECT kyc_status FROM users WHERE id = 1`).get().kyc_status, 'none'); // existing users must verify
   assert.equal(db.prepare('SELECT COUNT(*) n FROM transactions').get().n, 3);
   assert.equal(db.prepare(`SELECT ref_tx FROM transactions WHERE id = 'TXOLDREF'`).get().ref_tx, 'TXOLDPAY');
   assert.equal(db.prepare(`SELECT frozen FROM users WHERE id = 1`).get().frozen, 0);
@@ -311,6 +312,6 @@ test('migration: an old (v1) database upgrades with all data and balances kept',
   assert.equal(svc.userProfile(1).balance, 701);
   db.close();
   const again = open(file); // opening again is a no-op
-  assert.equal(again.prepare('PRAGMA user_version').get().user_version, 2);
+  assert.equal(again.prepare('PRAGMA user_version').get().user_version, 3);
   again.close();
 });

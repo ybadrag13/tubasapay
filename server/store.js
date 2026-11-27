@@ -10,7 +10,13 @@
 //   - Write requests wait until Turso has confirmed, so a restart or sleep loses nothing.
 // Without TURSO_DATABASE_URL the app runs purely locally, as before.
 
-const { open } = require('./db');
+const { open, MIGRATIONS } = require('./db');
+
+// Splits a migration script into single statements for Turso.
+function statements(script) {
+  return script.split('\n').map((l) => l.replace(/--.*$/, '')).join('\n')
+    .split(';').map((x) => x.trim()).filter((x) => x && !/^PRAGMA/i.test(x));
+}
 
 // ---------------- Turso HTTP client ----------------
 function encode(v) {
@@ -195,19 +201,31 @@ async function restoreFromTurso(db, turso, log = console) {
     return { restoredRows: 0, fresh: true };
   }
 
-  const remoteVersion = Number(meta[0].value);
-  if (remoteVersion !== localVersion)
-    throw new Error(`Turso database is at schema v${remoteVersion} but this code expects v${localVersion}. Upgrade both together.`);
+  let remoteVersion = Number(meta[0].value);
+  if (remoteVersion > localVersion)
+    throw new Error(`Turso database is at schema v${remoteVersion}, newer than this code (v${localVersion}). Deploy the newer code.`);
+  // Older Turso database: upgrade it, one version at a time, each inside one transaction.
+  while (remoteVersion < localVersion) {
+    const next = remoteVersion + 1;
+    if (!MIGRATIONS[next]) throw new Error(`No migration to v${next}`);
+    await turso.transaction([
+      ...statements(MIGRATIONS[next]).map((sql) => ({ sql })),
+      { sql: `UPDATE tsubu_meta SET value = ? WHERE key = 'schema_version'`, args: [String(next)] },
+    ]);
+    log.log(`[tsubupay] Turso database upgraded to schema v${next}.`);
+    remoteVersion = next;
+  }
 
   // Rebuild the local database from Turso, table by table, in pages.
   let total = 0;
   const copied = [];
   for (const t of tables) {
     const rows = [];
-    for (let offset = 0; ; offset += 2000) {
-      const page = await turso.query(`SELECT * FROM ${qid(t)} ORDER BY rowid LIMIT 2000 OFFSET ${offset}`);
+    const size = t === 'kyc_submissions' ? 10 : 2000; // rows with photos are big: fetch a few at a time
+    for (let offset = 0; ; offset += size) {
+      const page = await turso.query(`SELECT * FROM ${qid(t)} ORDER BY rowid LIMIT ${size} OFFSET ${offset}`);
       rows.push(...page);
-      if (page.length < 2000) break;
+      if (page.length < size) break;
     }
     copied.push([t, rows]);
   }
@@ -240,4 +258,4 @@ async function openStore({ dbPath, tursoUrl, tursoToken, log = console } = {}) {
   return { db: replicating(raw, replicator), replicator, turso, status: () => replicator.status() };
 }
 
-module.exports = { Turso, Replicator, replicating, restoreFromTurso, openStore, encode, decode };
+module.exports = { Turso, Replicator, replicating, restoreFromTurso, openStore, encode, decode, statements };

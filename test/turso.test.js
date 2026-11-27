@@ -13,7 +13,7 @@ const LIMITS = { login: 1000, register: 1000, chargeFail: 1000, lookup: 1000, ad
 
 async function boot(fake, token = fake.token) {
   const store = await openStore({ dbPath: ':memory:', tursoUrl: fake.url, tursoToken: token, log: quiet });
-  const app = createApp({ db: store.db, replicator: store.replicator, limits: LIMITS });
+  const app = createApp({ db: store.db, replicator: store.replicator, limits: LIMITS, service: { requireKyc: false, requirePhoneOtp: false } });
   await new Promise((r) => app.server.listen(0, '127.0.0.1', r));
   app.base = `http://127.0.0.1:${app.server.address().port}`;
   app.store = store;
@@ -124,4 +124,54 @@ test('a wrong token or URL stops the server from starting, with a clear message'
 
 test('libsql:// URLs are converted to https://', () => {
   assert.equal(new Turso('libsql://tsubupay-ybadrag13.aws-ap-northeast-1.turso.io', 't').base, 'https://tsubupay-ybadrag13.aws-ap-northeast-1.turso.io');
+});
+
+test('KYC photos survive a restart through Turso (binary data)', async () => {
+  const fake = await startFakeTurso();
+  const boot2 = async () => {
+    const store = await openStore({ dbPath: ':memory:', tursoUrl: fake.url, tursoToken: fake.token, log: quiet });
+    const a = createApp({ db: store.db, replicator: store.replicator, limits: { ...LIMITS, otp: 1000 } });
+    await new Promise((r) => a.server.listen(0, '127.0.0.1', r));
+    a.base = `http://127.0.0.1:${a.server.address().port}`;
+    return a;
+  };
+  let app = await boot2();
+  const u = client(app);
+  const o = (await u.post('/api/user/otp', { phone: '09012121212' })).body;
+  await u.post('/api/user/register', { phone: '09012121212', otp: o.demoCode, name: 'Hana', password: 'password123', pin: '2580' });
+  await u.post('/api/user/kyc/challenge');
+  const selfie = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from(Array.from({ length: 5000 }, (_, i) => i % 256))]);
+  const front = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(3000, 7)]);
+  const sub = await u.post('/api/user/kyc', { docType: 'passport', legalName: 'Sato Hana', birthDate: '1999-09-09', address: 'Osaka 1-1',
+    docNumber: 'TZ1234567', docFront: 'data:image/png;base64,' + front.toString('base64'), selfie: selfie.toString('base64') });
+  assert.equal(sub.status, 200, JSON.stringify(sub.body));
+  await app.replicator.settle(5000);
+  await new Promise((r) => app.server.close(r));
+
+  app = await boot2(); // empty disk again
+  const img = app.svc.adminKycImage(sub.body.id, 'selfie');
+  assert.ok(img.buf.equals(selfie), 'selfie bytes identical after restore');
+  assert.ok(app.svc.adminKycImage(sub.body.id, 'front').buf.equals(front));
+  assert.equal(app.svc.kycInfo('user', 1).status, 'pending');
+  await new Promise((r) => app.server.close(r));
+  await fake.close();
+});
+
+test('an older Turso database (v2) is upgraded to the new version on start, keeping data', async () => {
+  const { open, MIGRATIONS } = require('../server/db');
+  const { restoreFromTurso } = require('../server/store');
+  const fake = await startFakeTurso();
+  // Build a v2 database and push it to the fake Turso, like the live site today.
+  const v2 = open(':memory:', { migrate: false });
+  v2.exec('PRAGMA foreign_keys = OFF'); v2.exec(MIGRATIONS[2]); v2.exec('PRAGMA user_version = 2'); v2.exec('PRAGMA foreign_keys = ON');
+  v2.prepare(`INSERT INTO users (phone, name, pass_hash, pin_hash, created_at) VALUES ('09000000009', 'Old', 'x', 'y', 1)`).run();
+  v2.prepare(`INSERT INTO accounts (owner_type, owner_id, balance) VALUES ('user', 1, 0)`).run();
+  await restoreFromTurso(v2, new Turso(fake.url, fake.token), quiet);
+  assert.equal(fake.db.prepare(`SELECT value FROM tsubu_meta`).get().value, '2');
+
+  const store = await openStore({ dbPath: ':memory:', tursoUrl: fake.url, tursoToken: fake.token, log: quiet });
+  assert.equal(fake.db.prepare(`SELECT value FROM tsubu_meta`).get().value, '3');
+  assert.ok(fake.db.prepare(`SELECT name FROM sqlite_master WHERE name = 'kyc_submissions'`).get());
+  assert.equal(store.db.prepare(`SELECT kyc_status FROM users WHERE phone = '09000000009'`).get().kyc_status, 'none');
+  await fake.close();
 });
